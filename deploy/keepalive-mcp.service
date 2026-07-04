@@ -1,0 +1,34 @@
+[Unit]
+Description=Keepalive-MCP — persistent SSH pool for network gear
+After=network.target
+Requires=network.target
+
+[Service]
+Type=simple
+User=keepalive-mcp
+Group=keepalive-mcp
+WorkingDirectory=/opt/keepalive-mcp
+EnvironmentFile=/etc/keepalive-mcp/keepalive-mcp.env
+Environment=HOME=/etc/keepalive-mcp
+ExecStart=/opt/keepalive-mcp/venv/bin/python server.py
+Restart=on-failure
+RestartSec=5s
+
+# --- sandbox (binds 127.0.0.1:8784 behind nginx; no privileged port, no caps) ---
+NoNewPrivileges=yes
+UMask=0077
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

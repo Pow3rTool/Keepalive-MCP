@@ -1,0 +1,9 @@
+mcp==1.28.1
+scrapli[asyncssh]==2025.1.30
+scrapli-community==2025.1.30
+ntc-templates==7.9.0
+asyncpg==0.30.0
+PyJWT==2.13.0
+cryptography==48.0.1
+httpx==0.28.1
+pyyaml==6.0.2

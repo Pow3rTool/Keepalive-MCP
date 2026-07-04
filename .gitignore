@@ -1,0 +1,30 @@
+# secrets & local state — never commit
+.env
+*.env
+var/
+*.log
+
+# ssh key material / known_hosts / host-specific ssh config
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+ssh/
+known_hosts
+
+# editor swap/backup files
+*.swp
+*.swo
+*~
+*.bak
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
