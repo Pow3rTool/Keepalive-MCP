@@ -19,10 +19,10 @@ Config via env, or ~/.config/kadev.env (KEY=VALUE lines; env wins):
 
 Examples:
   kadev list
-  kadev add --name sw-fl1-01 --host 3.1.0.7 --platform cisco_iosxe \
-            --username keepalive --site floor-1 --role switch
-  kadev update sw-fl1-01 --enabled false      # drain out of service
-  kadev remove sw-fl1-01
+  kadev add --name switch01 --host 192.0.2.10 --platform cisco_iosxe \
+            --username keepalive --site site-a --role switch
+  kadev update switch01 --enabled false        # drain out of service
+  kadev remove switch01
   kadev token                                  # print a bearer (debugging)
 """
 from __future__ import annotations

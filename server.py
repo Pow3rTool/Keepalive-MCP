@@ -57,6 +57,11 @@ BIND              = os.environ.get("KA_BIND", "127.0.0.1")
 DB_DSN            = os.environ.get("KA_DB_DSN", "")
 SSH_KEY           = os.environ.get("KA_SSH_KEY", "/etc/keepalive-mcp/ssh/id_keepalive")
 SSH_CONFIG        = os.environ.get("KA_SSH_CONFIG", "/etc/keepalive-mcp/ssh/ssh_config")
+# Device login credential(s). The pool authenticates to EVERY device with a shared
+# service account (per-device username is in the DB). Provide a password (TACACS/
+# RADIUS or local), a private key, or both — at least one is required (_check_config).
+SSH_PASSWORD      = os.environ.get("KA_SSH_PASSWORD", "")
+SSH_SECONDARY     = os.environ.get("KA_SSH_SECONDARY", "")  # enable/privilege-escalation password
 # Host-key policy for device SSH: "strict" (verify against known_hosts, reject
 # unknown/changed) or "off" (skip verification — MITM-exposed, bootstrap/lab only).
 SSH_HOSTKEY_POLICY = os.environ.get("KA_SSH_HOSTKEY_POLICY", "strict").strip().lower()
@@ -74,6 +79,14 @@ MAX_OUT           = int(os.environ.get("KA_MAX_OUTPUT_CHARS", "60000"))
 KEEPALIVE_SECS    = int(os.environ.get("KA_KEEPALIVE_SECS", "30"))
 DEDICATED_TTL     = int(os.environ.get("KA_DEDICATED_TTL_SECS", "300"))  # 5 min idle
 RECONNECT_WAIT    = int(os.environ.get("KA_RECONNECT_WAIT_SECS", "300"))  # 5 min on DOWN
+# New-connection spin-up throttle. EVERY SSH connect (cold-start, keepalive reconnect,
+# hot-add) triggers a device-side TACACS/AAA transaction; a fleet-wide cold start or a
+# post-flap reconnect would otherwise fire them all at once and can crater a small AAA
+# cluster. Serialize connects to at most KA_CONNECT_RATE per second across the pool.
+# 0 (or negative) disables the throttle. NOTE: this gate is PER-PROCESS — a future
+# multi-worker/sharded deployment multiplies the aggregate rate by the worker count,
+# so set it to (global_budget / workers) there, or move to a shared limiter.
+CONNECT_RATE      = float(os.environ.get("KA_CONNECT_RATE", "1.0"))
 
 SESSION_SECRET    = os.environ.get("KA_SESSION_SECRET", "") or secrets.token_hex(32)
 KEY_PATH          = os.environ.get("KA_CERT_KEY_PATH", "/etc/keepalive-mcp/keepalive-mcp.key")
@@ -220,6 +233,13 @@ def _check_config():
     else:
         print("[keepalive-mcp] WARNING: SSH host-key verification is OFF "
               "(KA_SSH_HOSTKEY_POLICY=off) — MITM-exposed. Not for production.", flush=True)
+    # Fail closed if there's no way to authenticate to devices: need a password
+    # (TACACS/RADIUS/local) or a readable private key — at least one.
+    if not SSH_PASSWORD and not (SSH_KEY and os.path.exists(SSH_KEY)):
+        raise SystemExit(
+            "No device SSH credential configured: set KA_SSH_PASSWORD (shared "
+            "TACACS/RADIUS or local service account) and/or provide KA_SSH_KEY "
+            "at a readable path. At least one is required.")
 
 _check_config()
 
@@ -443,6 +463,31 @@ class _Session:
         self.last_active    = time.time()
 
 
+class _ConnectRateLimiter:
+    """Async token-scheduler that spaces new SSH connections to protect the
+    downstream TACACS/AAA cluster. Each caller reserves the next free time slot and
+    sleeps until it, so N concurrent connects drain at CONNECT_RATE/sec in arrival
+    order instead of stampeding. Idle periods do not bank credit (strict spacing:
+    the first connect after a quiet spell is immediate, never a saved-up burst)."""
+    def __init__(self, rate_per_sec: float):
+        self._interval = (1.0 / rate_per_sec) if rate_per_sec and rate_per_sec > 0 else 0.0
+        self._lock     = asyncio.Lock()
+        self._next     = 0.0   # monotonic time of the next free slot
+
+    async def acquire(self):
+        if self._interval <= 0:
+            return
+        async with self._lock:
+            now  = time.monotonic()
+            slot = now if now > self._next else self._next
+            self._next = slot + self._interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+_connect_gate = _ConnectRateLimiter(CONNECT_RATE)
+
+
 class Pool:
     """
     Per-device connection pool.
@@ -472,9 +517,14 @@ class Pool:
             self._meta[d["name"]] = d
             self._locks[d["name"]] = asyncio.Lock()
             self._conns[d["name"]] = []
-        # initial connections + keepalive tasks
-        await asyncio.gather(*[self._init_device(d["name"]) for d in devices],
-                              return_exceptions=True)
+        # Initial connects run in the BACKGROUND: with the connect throttle enabled a
+        # cold start warms devices at CONNECT_RATE/sec, so blocking here would delay app
+        # readiness by ~(device count / rate) seconds. Instead we become ready at once
+        # and warm up in the background; a call for a not-yet-warm device gets the normal
+        # "device_down" until its slot comes up (PEs/important devices warm first by list
+        # order). The keepalive loop retries any that fail.
+        self._tasks.append(asyncio.create_task(
+            self._initial_warmup([d["name"] for d in devices])))
         self._tasks.append(asyncio.create_task(self._keepalive_loop()))
         self._tasks.append(asyncio.create_task(self._session_reaper()))
         self._tasks.append(asyncio.create_task(self._listen_devices()))
@@ -495,13 +545,27 @@ class Pool:
         meta = self._meta.get(device)
         if not meta:
             return None
+        # Pace new connects so a mass cold-start / reconnect doesn't stampede the
+        # device-side TACACS/AAA cluster (see CONNECT_RATE). Covers every connect path:
+        # cold-start warmup, keepalive-loop reconnect, and hot-add reconcile all land here.
+        await _connect_gate.acquire()
         ssh_cfg = SSH_CONFIG if os.path.exists(SSH_CONFIG) else ""
         strict = SSH_HOSTKEY_POLICY == "strict"
+        # Assemble client-auth creds: password (TACACS/RADIUS/local) and/or a private
+        # key. Only pass a key if the file actually exists, so a password-only
+        # deployment doesn't fail asyncssh trying to load a nonexistent key. asyncssh
+        # negotiates password AND keyboard-interactive from auth_password, which covers
+        # the usual TACACS prompt flows.
+        auth_kwargs: dict = {"auth_username": meta["username"]}
+        if SSH_PASSWORD:
+            auth_kwargs["auth_password"] = SSH_PASSWORD
+        if SSH_KEY and os.path.exists(SSH_KEY):
+            auth_kwargs["auth_private_key"] = SSH_KEY
+        if SSH_SECONDARY:
+            auth_kwargs["auth_secondary"] = SSH_SECONDARY   # 'enable' after login
         try:
             sc = AsyncScrapli(
                 host=meta["host"], port=meta["port"],
-                auth_username=meta["username"],
-                auth_private_key=SSH_KEY,
                 auth_strict_key=strict,                       # reject unknown/changed host keys
                 ssh_known_hosts_file=SSH_KNOWN_HOSTS if strict else "",
                 platform=meta["platform"],
@@ -511,7 +575,8 @@ class Pool:
                     "keepalive_interval": 20,
                     "keepalive_count_max": 3,
                 }},
-                timeout_socket=15, timeout_transport=15, timeout_ops=60)
+                timeout_socket=15, timeout_transport=15, timeout_ops=60,
+                **auth_kwargs)
             await sc.open()
             conn = _Conn(device, sc)
             await _audit("pool", "pool", None, device, "pool-connect",
@@ -527,6 +592,12 @@ class Pool:
         if conn:
             self._conns[device].append(conn)
         # device starts as DOWN if connection failed; keepalive_loop will retry
+
+    async def _initial_warmup(self, names: list[str]):
+        """Warm the whole fleet in the background (see start()). Connects are paced by
+        the shared connect throttle, so this fans out but drains at CONNECT_RATE/sec."""
+        await asyncio.gather(*[self._init_device(n) for n in names],
+                             return_exceptions=True)
 
     # ── dynamic reconcile (LISTEN/NOTIFY driven) ─────────────────────
     async def _listen_devices(self):

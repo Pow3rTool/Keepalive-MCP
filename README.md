@@ -125,10 +125,13 @@ kadev remove <name>
 2. **Configure.** Copy [`.env.example`](.env.example) and fill it in — Entra tenant/
    client/audience, `KA_DB_DSN`, SSH key + known_hosts. Every setting is documented
    inline in that file.
-3. **Create the DB schema** and apply the notify trigger:
+3. **Create the DB schema** (base tables first), then apply the notify trigger:
    ```
+   psql "$KA_DB_DSN" -f deploy/migrations/000_schema.sql
    psql "$KA_DB_DSN" -f deploy/migrations/001_devices_notify.sql
    ```
+   `000` creates the `devices` and `audit` tables (+ the `devices_id_seq` that `001`
+   grants on); run it as the role that owns the DB so no cross-owner grants are needed.
 4. **Seed SSH host keys** (required under the default `strict` host-key policy):
    ```
    ssh-keyscan -f <device-hosts> > /etc/keepalive-mcp/ssh/known_hosts

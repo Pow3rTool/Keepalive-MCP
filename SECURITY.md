@@ -37,13 +37,15 @@ controls, and the residual risks an operator accepts by running it.
   **refused** if that audit write fails. Pushes halt at the first rejected line and
   never `write memory` on a failed change.
 
-### ⚠️ Residual risk — one shared SSH key (accepted)
+### ⚠️ Residual risk — one shared device credential (accepted)
 
-`KA_SSH_KEY` authenticates to **every** device in the pool. A single key compromise
-= SSH access to the whole fleet. Treat the key as tier-0: 0600, owned by the service
-user, on an encrypted volume, never copied off-box. A per-device / short-lived-
-credential model is the longer-term direction (see roadmap). Document custody in your
-runbook.
+The pool authenticates to **every** device with a single shared service-account
+credential — a private key (`KA_SSH_KEY`) and/or a password (`KA_SSH_PASSWORD`, e.g. a
+central TACACS/RADIUS account). One compromise = SSH access to the whole fleet. Treat
+it as tier-0: key files 0600 and the password only in the env file (0640, service-user
+owned), on an encrypted volume, never copied off-box. Prefer scoping the account's
+device privileges to the minimum the tools need. A per-device / short-lived-credential
+model is the longer-term direction (see roadmap). Document custody in your runbook.
 
 ### ⚠️ Residual risk — pivoting (accepted, by design)
 
