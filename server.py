@@ -87,6 +87,11 @@ RECONNECT_WAIT    = int(os.environ.get("KA_RECONNECT_WAIT_SECS", "300"))  # 5 mi
 # multi-worker/sharded deployment multiplies the aggregate rate by the worker count,
 # so set it to (global_budget / workers) there, or move to a shared limiter.
 CONNECT_RATE      = float(os.environ.get("KA_CONNECT_RATE", "1.0"))
+# HTTP access logging is OFF by default so routine request lines don't spray into
+# syslog/Ringdown (and the OAuth ?code= on /auth/callback is never logged). Set
+# KA_ACCESS_LOG=true for a debugging session; the redaction filter still scrubs
+# code/state/token/secret from any access line that IS emitted.
+ACCESS_LOG        = os.environ.get("KA_ACCESS_LOG", "false").strip().lower() in ("1", "true", "yes")
 
 SESSION_SECRET    = os.environ.get("KA_SESSION_SECRET", "") or secrets.token_hex(32)
 KEY_PATH          = os.environ.get("KA_CERT_KEY_PATH", "/etc/keepalive-mcp/keepalive-mcp.key")
@@ -1380,8 +1385,8 @@ def _status_authorized(request: Request) -> dict | None:
     if not claims:
         return None
     roles = [str(r).lower() for r in (claims.get("roles") or [])]
-    if STATUS_ROLE not in roles:
-        return None
+    if STATUS_ROLE not in roles and not (ADMIN_ROLES & set(roles)):
+        return None                                    # admin is a superset of the status role
     return claims
 
 
@@ -1523,10 +1528,10 @@ async def auth_callback(request: Request):
             "(check that the login requested the API scope and that the app "
             "registration exposes it).",
             status_code=400)
-    if STATUS_ROLE not in roles:
+    if STATUS_ROLE not in roles and not (ADMIN_ROLES & set(roles)):
         return Response(
-            f"forbidden: the '{STATUS_ROLE}' app role is required to view status "
-            f"(assign it to your principal on the Keepalive app registration).",
+            f"forbidden: the '{STATUS_ROLE}' or Keepalive.Admin app role is required to view "
+            f"status (assign it to your principal on the Keepalive app registration).",
             status_code=403)
 
     cookie = _make_session_cookie(
@@ -1752,6 +1757,33 @@ async def devices_delete(request):
 
 
 # ── app builder with lifespan ─────────────────────────────────────────────────
+def _install_access_log_redaction():
+    """Redact OAuth code/state/tokens/secrets from any uvicorn access-log line (only
+    emitted when KA_ACCESS_LOG=true) so a debug session can't leak the /auth/callback
+    ?code= into syslog/Ringdown."""
+    import logging, re
+    _pat = re.compile(r'((?:code|state|session_state|id_token|access_token|'
+                      r'client_assertion|client_secret|refresh_token)=)[^&\s"\'>]+', re.I)
+    _markers = ("code=", "state=", "token=", "secret=", "assertion=")
+
+    class _Redact(logging.Filter):
+        def filter(self, record):
+            try:
+                if record.args:
+                    a = list(record.args)
+                    for i, v in enumerate(a):
+                        if isinstance(v, str) and any(m in v for m in _markers):
+                            a[i] = _pat.sub(r"\1<redacted>", v)
+                    record.args = tuple(a)
+            except Exception:
+                pass
+            return True
+
+    lg = logging.getLogger("uvicorn.access")
+    if not any(f.__class__.__name__ == "_Redact" for f in lg.filters):
+        lg.addFilter(_Redact())
+
+
 def _build_app():
     from contextlib import asynccontextmanager
     from starlette.applications import Starlette
@@ -1759,6 +1791,7 @@ def _build_app():
 
     @asynccontextmanager
     async def lifespan(app):
+        _install_access_log_redaction()
         async with mcp.session_manager.run():
             await pool.start()
             print(f"[keepalive-mcp] pool started · {len(pool._meta)} devices · port {PORT}", flush=True)
@@ -1787,4 +1820,4 @@ def _build_app():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(_build_app(), host=BIND, port=PORT, log_level="info")
+    uvicorn.run(_build_app(), host=BIND, port=PORT, log_level="info", access_log=ACCESS_LOG)
