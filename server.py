@@ -62,6 +62,14 @@ SSH_CONFIG        = os.environ.get("KA_SSH_CONFIG", "/etc/keepalive-mcp/ssh/ssh_
 # RADIUS or local), a private key, or both — at least one is required (_check_config).
 SSH_PASSWORD      = os.environ.get("KA_SSH_PASSWORD", "")
 SSH_SECONDARY     = os.environ.get("KA_SSH_SECONDARY", "")  # enable/privilege-escalation password
+# Shared service-account username for admin-onboarded devices (discover_new_device).
+# Fleet-wide creds mean the per-device delta is just name/host/platform; username
+# defaults to this when the caller doesn't supply one.
+DEFAULT_USERNAME  = os.environ.get("KA_DEFAULT_USERNAME", "")
+# Read-only mode: don't register the config-push verb (apply) at all — it never appears
+# in tools/list, so the LLM can't see or call it — and tell the model up front that only
+# reads work. Use when the deployment (or the SSH service account) is read-only.
+READONLY          = os.environ.get("KA_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
 # Host-key policy for device SSH: "strict" (verify against known_hosts, reject
 # unknown/changed) or "off" (skip verification — MITM-exposed, bootstrap/lab only).
 SSH_HOSTKEY_POLICY = os.environ.get("KA_SSH_HOSTKEY_POLICY", "strict").strip().lower()
@@ -76,6 +84,8 @@ if SSH_HOSTKEY_POLICY == "off":
     import logging as _logging
     _logging.getLogger("scrapli").setLevel(_logging.ERROR)
 MAX_OUT           = int(os.environ.get("KA_MAX_OUTPUT_CHARS", "60000"))
+CAPTURE_TTL       = int(os.environ.get("KA_CAPTURE_TTL_SECS", "600"))   # captured-output lifetime
+CAPTURE_MAX       = int(os.environ.get("KA_CAPTURE_MAX", "32"))         # max concurrent captures
 KEEPALIVE_SECS    = int(os.environ.get("KA_KEEPALIVE_SECS", "30"))
 DEDICATED_TTL     = int(os.environ.get("KA_DEDICATED_TTL_SECS", "300"))  # 5 min idle
 RECONNECT_WAIT    = int(os.environ.get("KA_RECONNECT_WAIT_SECS", "300"))  # 5 min on DOWN
@@ -128,19 +138,29 @@ LIVE_APPLY = {"cisco_iosxe", "cisco_ios", "cisco_asa", "cisco_nxos"}
 # Platforms with native commit/abort
 COMMIT_CAP = {"cisco_iosxr", "arista_eos", "juniper_junos"}
 
-READ_OK = ("show", "ping", "traceroute", "dir", "display", "more", "get", "verify")
+# Platforms an admin may onboard via discover_new_device (the live Cisco fleet).
+# Widen (e.g. cisco_ios, cisco_nxos) if a device outside this set needs tool onboarding.
+_ONBOARD_PLATFORMS = {"cisco_iosxe", "cisco_iosxr", "cisco_asa"}
 
-# Reads refused outright. Full-config / tech-support dumps are DENIED (not merely
-# redacted) — they are the dense secret source and line-based redaction misses too
-# many vendor variants (GPT #6). apply's internal diff still runs `show
-# running-config` directly on the connection — that path is separate from this tool
-# and its output is redacted before return.
-_BLOCKED_READ = [re.compile(p, re.I) for p in (
+READ_OK = ("show", "ping", "traceroute", "dir", "display", "more", "get", "verify",
+           "changeto")   # ASA multi-context navigation (changeto context/system) — read-safe
+
+# Config / tech-support dumps — the dense secret source. Blocked BY DEFAULT (line-based
+# redaction misses too many vendor variants on a full config — GPT #6); set
+# KA_ALLOW_CONFIG_READ=true to let operators read them. Output is ALWAYS secret-redacted
+# (_redact_secrets) regardless. apply's internal diff reads running-config directly on the
+# connection — a separate path, also redacted before return.
+ALLOW_CONFIG_READ = os.environ.get("KA_ALLOW_CONFIG_READ", "").strip().lower() in ("1", "true", "yes", "on")
+_BLOCKED_CONFIG = [re.compile(p, re.I) for p in (
     r"\bshow\s+run(n|\b)",                       # show run / show running-config [...]
     r"\bshow\s+start(u|\b)",                     # show startup-config
     r"\bshow\s+config(u|\b)",                    # show config / show configuration (Junos)
     r"\bshow\s+tech(-|\s|\b)",                   # show tech-support
     r"running-config|startup-config",            # any residual (e.g. more system:running-config)
+)]
+# Raw key material and arbitrary file reads — ALWAYS refused (redaction can't help; these
+# dump raw key bytes / arbitrary files), even when KA_ALLOW_CONFIG_READ is on.
+_BLOCKED_ALWAYS = [re.compile(p, re.I) for p in (
     r"\bcrypto\s+key\b",                         # show crypto key ... (private keys)
     r"\bkey\s+(chain|zeroize|mypubkey)\b",
     r"\bmore\b.*(:|/)",                          # more nvram:/flash:/system: arbitrary file read
@@ -166,10 +186,16 @@ _REDACT_RULES = [re.compile(p, re.I) for p in (
 )]
 
 def _blocked_read(cmd: str) -> str:
-    for rx in _BLOCKED_READ:
+    for rx in _BLOCKED_ALWAYS:
         if rx.search(cmd):
-            return ("refused: full-config/tech-support and key/file reads are blocked (they expose "
-                    "credentials). Use a targeted 'show' for the specific state you need.")
+            return ("refused: raw key material and arbitrary file reads are blocked — they dump "
+                    "secrets/files that can't be safely redacted. Use a targeted 'show'.")
+    if not ALLOW_CONFIG_READ:
+        for rx in _BLOCKED_CONFIG:
+            if rx.search(cmd):
+                return ("refused: full-config/tech-support reads are disabled here. An operator can "
+                        "enable them with KA_ALLOW_CONFIG_READ=true (output stays secret-redacted); "
+                        "until then use a targeted 'show' for the specific state you need.")
     return ""
 
 def _redact_secrets(text: str) -> str:
@@ -373,6 +399,19 @@ def _require_config(ctx):
     oid, upn, roles = ident
     if not (set(roles) & CONFIG_ROLES):
         return json.dumps({"error": "forbidden: Keepalive.Config role required"})
+    return oid, upn, _session_id(ctx)
+
+def _require_admin(ctx):
+    """Returns (oid, upn, session_id) or error JSON string. Keepalive.Admin only —
+    for fleet-shaping verbs (discover_new_device). The MCP tool list is advertised to
+    everyone, so this call-time gate IS the boundary: non-admins see the verb but any
+    call fails closed here."""
+    ident = _auth(ctx)
+    if not ident:
+        return json.dumps({"error": "unauthorized: valid Entra bearer required"})
+    oid, upn, roles = ident
+    if not (set(roles) & ADMIN_ROLES):
+        return json.dumps({"error": "forbidden: Keepalive.Admin role required"})
     return oid, upn, _session_id(ctx)
 
 
@@ -968,6 +1007,41 @@ def _cap(s: str) -> str:
     return s[:MAX_OUT] + f"\n\n[…truncated {len(s) - MAX_OUT} of {len(s)} chars]"
 
 
+# ── large-output capture (RAM only; never persisted — output can contain config) ───────
+# Output over MAX_OUT is stashed here and returned as a handle + preview instead of a lossy
+# truncation, so the LLM can grep/page the whole thing via read_output. Per-principal (oid),
+# TTL-expired, count-capped.
+_captures: dict[str, dict] = {}
+
+def _prune_captures() -> None:
+    now = time.time()
+    for cid in [c for c, v in _captures.items() if now - v["created"] > CAPTURE_TTL]:
+        _captures.pop(cid, None)
+    while len(_captures) > CAPTURE_MAX:
+        _captures.pop(min(_captures, key=lambda c: _captures[c]["created"]), None)
+
+def _capture_output(oid: str, device: str, command: str, text: str) -> dict:
+    """Stash a large output and return a handle + preview + how to explore it."""
+    _prune_captures()
+    cid   = secrets.token_hex(4)
+    lines = text.splitlines()
+    _captures[cid] = {"oid": oid, "device": device, "command": command,
+                      "lines": lines, "chars": len(text), "created": time.time()}
+    return {
+        "captured":    True,
+        "capture_id":  cid,
+        "device":      device,
+        "command":     command,
+        "total_lines": len(lines),
+        "total_chars": len(text),
+        "preview":     text[:4000] + ("\n…" if len(text) > 4000 else ""),
+        "note": (f"Output is large ({len(lines)} lines) — captured server-side for "
+                 f"~{CAPTURE_TTL // 60}m. read_output(capture_id='{cid}', pattern='<regex>') "
+                 f"to grep, or (offset=, limit=) to page. Cheaper if you know the target: "
+                 f"re-run with an on-device filter, e.g. '{command} | include <x>'."),
+    }
+
+
 # ── FastMCP ───────────────────────────────────────────────────────────────────
 def _derive_allowed_hosts() -> list[str]:
     if ALLOWED_HOSTS:
@@ -981,16 +1055,26 @@ def _derive_allowed_hosts() -> list[str]:
 
 _ALLOWED_HOSTS = _derive_allowed_hosts()
 
+_RO_BANNER = ("READ-ONLY MODE: this server only runs read commands "
+              "(show/ping/traceroute/dir/verify) via `run`; configuration changes are "
+              "disabled and the apply tool is not available — do not attempt to push config. "
+              if READONLY else "")
+
 mcp = FastMCP(
     "keepalive-mcp",
     instructions=(
+        _RO_BANNER +
         "Reach into Cisco (and multi-vendor) network gear over SSH. "
         "find_devices searches the inventory; run executes read-only commands "
         "(show, ping, traceroute) and returns structured JSON when parsed=true; "
         "apply pushes config — confirm=false is a dry-run, confirm=true applies. "
         "claim_session reserves an exclusive connection for multi-command work; "
         "release_session returns it. A Keepalive.Read role allows find_devices and run. "
-        "A Keepalive.Config role additionally allows apply and session management."),
+        "A Keepalive.Config role additionally allows apply and session management. "
+        "discover_new_device (Keepalive.Admin only) onboards a device by name + host. "
+        "Large command output is auto-captured; read_output greps (pattern=) or pages "
+        "(offset=/limit=) it by capture_id. For a known target, filter on the device first "
+        "(e.g. `show access-list | include <x>`) — far cheaper than pulling the whole dump."),
     host=BIND, port=PORT, stateless_http=False, json_response=False,
     streamable_http_path="/",
     transport_security=TransportSecuritySettings(
@@ -1055,11 +1139,18 @@ async def find_devices(ctx: Context, query: str = "", role: str = "",
 
 @mcp.tool()
 async def run(ctx: Context, device: str, command: str,
-              parsed: bool = False, session_id: str | None = None) -> str:
-    """Run a READ-ONLY command on a device (show, ping, traceroute, dir, verify).
+              parsed: bool = False, session_id: str | None = None,
+              capture: bool = False) -> str:
+    """Run a READ-ONLY command on a device (show, ping, traceroute, dir, verify;
+    `changeto` for ASA multi-context navigation).
     parsed=true returns structured JSON via TextFSM where supported.
-    Pass session_id if you have a dedicated session from claim_session.
-    Write commands (configure/reload/copy/write/clear) are refused — use apply."""
+    Pass session_id if you have a dedicated session from claim_session — recommended for
+    ASA context work so `changeto` stays scoped to your own connection.
+    LARGE OUTPUT: anything over the char cap is auto-captured server-side and returned as a
+    capture_id + preview (not truncated) — use read_output to grep/page it. capture=true
+    forces that even for smaller output. Cheaper for a known target: filter on the device,
+    e.g. 'show access-list | include <x>' or 'show run | section <x>'.
+    Write commands (configure/reload/copy/write/clear) are refused."""
     r = _require_read(ctx)
     if isinstance(r, str):
         return r
@@ -1070,7 +1161,9 @@ async def run(ctx: Context, device: str, command: str,
     if blocked:
         return json.dumps({"error": blocked})
     if not cmd.lower().startswith(READ_OK):
-        return json.dumps({"error": f"'{cmd.split()[0]}' is not a read-only command; use apply"})
+        hint = ("this server is read-only — only show/ping/traceroute/dir/verify are permitted"
+                if READONLY else "use apply to push config")
+        return json.dumps({"error": f"'{cmd.split()[0]}' is not a read-only command; {hint}"})
 
     t0 = time.monotonic()
     conn_obj: _Conn | None = None
@@ -1117,10 +1210,85 @@ async def run(ctx: Context, device: str, command: str,
     dur = int((time.monotonic() - t0) * 1000)
     asyncio.create_task(_audit(oid, upn, session_id or mcp_sid, device,
                                 "read", cmd, rc, status, dur, len(out)))
+    # Large output: stash it and return a searchable handle instead of a lossy truncation,
+    # so the LLM can grep/page the whole thing via read_output rather than lose it.
+    if status == "ok" and (capture or len(out) > MAX_OUT):
+        return json.dumps(_capture_output(oid, device, cmd, out), indent=2)
     return _cap(out)
 
 
 @mcp.tool()
+async def read_output(ctx: Context, capture_id: str, pattern: str = "",
+                      offset: int = 0, limit: int = 200, context: int = 0,
+                      block: bool = False) -> str:
+    """Examine a large output captured by a prior run (which returned a capture_id).
+    pattern = grep (case-insensitive regex): returns matching lines with line numbers.
+    block=true makes each match return its whole INDENTATION STANZA instead of one line —
+    the column-0 header + everything indented under it (e.g. an ASA object-group ACE plus
+    its expanded host/port rules, or an IOS `interface` and its sub-lines). Combine with
+    context=N to also include N lines above the header (grabs the preceding ACL `remark`).
+    context alone (no block) just adds N lines around each match. No pattern = page: lines
+    offset..offset+limit. Captures are per-user and expire — re-run the command if it's gone."""
+    r = _require_read(ctx)
+    if isinstance(r, str):
+        return r
+    oid, upn, sid = r
+    _prune_captures()
+    cap = _captures.get(capture_id)
+    if not cap or cap["oid"] != oid:
+        return json.dumps({"error": f"capture '{capture_id}' not found or expired "
+                           f"(they last ~{CAPTURE_TTL // 60}m and are per-user) — re-run the command"})
+    lines = cap["lines"]; total = len(lines)
+    limit = max(1, min(limit, 2000))
+    if pattern:
+        try:
+            rx = re.compile(pattern, re.I)
+        except re.error as e:
+            return json.dumps({"error": f"bad regex: {e}"})
+        cn = max(0, min(context, 10))
+        indent = lambda s: len(s) - len(s.lstrip())
+        ranges: list[list[int]] = []; matches = 0
+        for i, ln in enumerate(lines):
+            if not rx.search(ln):
+                continue
+            matches += 1
+            if block:
+                h = i
+                while h > 0 and indent(lines[h]) != 0:      # nearest column-0 header at/above
+                    h -= 1
+                e = h + 1
+                while e < total and indent(lines[e]) != 0:  # span to the next column-0 line
+                    e += 1
+                ranges.append([max(0, h - cn), e])
+            else:
+                ranges.append([max(0, i - cn), min(total, i + cn + 1)])
+            if matches >= limit:
+                break
+        ranges.sort()
+        merged: list[list[int]] = []                        # coalesce overlapping stanzas
+        for s, e in ranges:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        sep  = "\n--\n" if block else "\n"
+        body = sep.join("\n".join(f"{k+1}: {lines[k]}" for k in range(s, e)) for s, e in merged)
+        meta = {"capture_id": capture_id, "device": cap["device"], "command": cap["command"],
+                "pattern": pattern, "mode": "block" if block else "lines",
+                "matches": matches, "blocks": len(merged), "total_lines": total,
+                "note": "match limit hit — refine the pattern or raise limit" if matches >= limit else ""}
+    else:
+        offset = max(0, offset)
+        chunk  = lines[offset: offset + limit]
+        body   = "\n".join(f"{offset+k+1}: {ln}" for k, ln in enumerate(chunk))
+        nxt    = offset + limit if offset + limit < total else None
+        meta = {"capture_id": capture_id, "device": cap["device"], "command": cap["command"],
+                "total_lines": total, "returned": len(chunk), "next_offset": nxt}
+    asyncio.create_task(_audit(oid, upn, sid, cap["device"], "read",
+                                f"read_output {pattern or ('@' + str(offset))}", 0, "ok", 0, len(body)))
+    return json.dumps(meta, indent=2) + "\n\n" + _cap(body)
+
+
 async def apply(ctx: Context, device: str, config: str,
                 confirm: bool = False, save: bool = False,
                 session_id: str | None = None) -> str:
@@ -1196,6 +1364,12 @@ async def apply(ctx: Context, device: str, config: str,
                                 "write", "; ".join(lines)[:500],
                                 rc, status, dur, len(diff_text)))
     return json.dumps(result, indent=2)
+
+
+# apply is the only write verb — register it ONLY when not read-only. In read-only mode
+# it is never added to the MCP tool list, so the LLM cannot see or call config-push.
+if not READONLY:
+    mcp.tool()(apply)
 
 
 async def _apply_live(conn: _Conn, device: str, lines: list[str], save: bool) -> dict:
@@ -1313,6 +1487,73 @@ async def release_session(ctx: Context, session_id: str) -> str:
 
     await pool._release_session_internal(session_id, reason="released")
     return json.dumps({"status": "released", "session_id": session_id})
+
+
+@mcp.tool()
+async def discover_new_device(ctx: Context, name: str, host: str,
+                              platform: str = "cisco_iosxe",
+                              site: str = "", role: str = "") -> str:
+    """ADMIN-ONLY: onboard a device to the pool by name + host, then verify it.
+    Fleet SSH creds are shared, so you only supply name, host (IP preferred over DNS),
+    and platform — cisco_iosxe (default), cisco_iosxr, or cisco_asa. Optional site/role
+    tags. Inserts the device (the pool connects it immediately) and waits briefly to
+    report whether it came up CONNECTED or is still DOWN (bad host/reachability/creds).
+    Requires the Keepalive.Admin role."""
+    r = _require_admin(ctx)
+    if isinstance(r, str):
+        return r
+    oid, upn, sid = r
+
+    name = (name or "").strip()
+    if not _DEVICE_NAME_RE.match(name):
+        return json.dumps({"error": "name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"})
+    host = (host or "").strip()
+    if not host:
+        return json.dumps({"error": "host (IP or DNS name) is required"})
+    platform = (platform or "cisco_iosxe").strip().lower()
+    if platform not in _ONBOARD_PLATFORMS:
+        return json.dumps({"error": f"platform must be one of: {', '.join(sorted(_ONBOARD_PLATFORMS))}"})
+    username = (DEFAULT_USERNAME or "").strip()
+    if not username:
+        return json.dumps({"error": "no service-account username configured — set KA_DEFAULT_USERNAME"})
+
+    # Insert into the source-of-truth table; the LISTEN/NOTIFY reconcile connects it.
+    try:
+        db = await _db_pool()
+        await db.execute(
+            "INSERT INTO devices (name, host, port, platform, username, role, site, source) "
+            "VALUES ($1,$2,22,$3,$4,$5,$6,'discover')",
+            name, host, platform, username, (role or None), (site or None))
+    except asyncpg.UniqueViolationError:
+        return json.dumps({"error": f"device '{name}' already exists — use kadev/REST to update it"})
+    except Exception as e:
+        return json.dumps({"error": f"insert failed: {e}"})
+
+    await _audit(oid, upn, sid, name, "device-add", f"{host} {platform}", 0, "created", 0, 0)
+
+    # Verify: the connect happens in the background (NOTIFY → reconcile → connect, paced by
+    # the connect-rate gate). Poll for CONNECTED; report the state if it hasn't come up yet.
+    state = "pending"
+    for _ in range(16):                       # up to ~8s
+        await asyncio.sleep(0.5)
+        st = {s["name"]: s["state"] for s in pool.status_data()}.get(name)
+        if st == "CONNECTED":
+            state = "CONNECTED"; break
+        if st:
+            state = st                        # DOWN while still connecting / after a failure
+    ok = state == "CONNECTED"
+    return json.dumps({
+        "status":     "added",
+        "name":       name,
+        "host":       host,
+        "platform":   platform,
+        "username":   username,
+        "connection": state,
+        "reachable":  ok,
+        "note": ("connected and warm — ready for run/apply" if ok else
+                 "added to inventory but not CONNECTED yet; the pool keeps retrying. "
+                 "Check host/reachability and that the shared creds work on this device."),
+    }, indent=2)
 
 
 # ── status page (Starlette route) ─────────────────────────────────────────────

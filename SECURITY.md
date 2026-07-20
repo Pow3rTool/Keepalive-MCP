@@ -27,11 +27,17 @@ controls, and the residual risks an operator accepts by running it.
     ```
   - `off` — verification skipped (MITM-exposed). Trusted bootstrap / lab only;
     the server logs a loud warning at startup.
-- **Read-command safety:** `run` refuses reads that dump raw key/credential
+- **Read-command safety:** `run` always refuses reads that dump raw key/credential
   material or arbitrary files (private keys, `more nvram:/flash:`, etc.), and
   **redacts** secret-bearing lines (passwords, community strings, PSKs, key
   material) from all returned output. (Read audit rows store only a char count of
   output, never the output itself.)
+  - **Full-config / tech-support reads** (`show running-config`, `show tech-support`)
+    are **blocked by default** — a full config is a dense secret source and line-based
+    redaction is imperfect across vendor variants. Set `KA_ALLOW_CONFIG_READ=true` to
+    permit them for operators who need them; output is still secret-redacted, but treat
+    that redaction as best-effort on a full config, and rely on the audit trail. The
+    raw key/file-read blocks above are **not** lifted by this flag.
 - **Config pushes** (`apply`) are **write-before-execute audited**: the intent to
   mutate is recorded durably *before* the device is touched, and the push is
   **refused** if that audit write fails. Pushes halt at the first rejected line and

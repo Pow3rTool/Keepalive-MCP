@@ -37,6 +37,8 @@ opens each connection once and keeps it alive:
 | `apply` | `Keepalive.Config` | Push config lines. **`confirm=false` (default) is a dry-run preview**; call again with `confirm=true` to apply. `save=true` writes memory only on full success. |
 | `claim_session` | `Keepalive.Config` | Reserve an **exclusive** connection to a device for multi-step work; returns a `session_id` to pass to `run`/`apply`. Auto-releases after `KA_DEDICATED_TTL_SECS` of inactivity. |
 | `release_session` | `Keepalive.Config` | Release a dedicated session early. |
+| `discover_new_device` | `Keepalive.Admin` | Onboard a device by **name + host** (IP preferred), platform `cisco_iosxe`/`cisco_iosxr`/`cisco_asa`. Uses the shared `KA_DEFAULT_USERNAME`/creds, inserts the row (pool connects it live via `NOTIFY`), and reports `CONNECTED` vs `DOWN`. Fleet management also available via the `/devices` REST API + `kadev`. |
+| `read_output` | `Keepalive.Read` | Grep (`pattern=`, with `context` lines) or page (`offset`/`limit`) a large output captured by a prior `run` — output over `KA_MAX_OUTPUT_CHARS` is stashed server-side (RAM, per-user, TTL'd) as a `capture_id` instead of being truncated, so the LLM can examine multi-MB dumps (big ACLs, tech-support) in slices. |
 
 ### Config-push safety (`apply`)
 
@@ -158,6 +160,11 @@ for the authoritative, commented list. Notable knobs:
 | `KA_REQUIRED_SCOPE` / `KA_STATUS_ROLE` | delegated scope and status-page role |
 | `KA_BIND` / `KA_PORT` | listen address (default `127.0.0.1:8784`) |
 | `KA_KEEPALIVE_SECS` / `KA_DEDICATED_TTL_SECS` | pool tuning |
+| `KA_READONLY` | hide the `apply` config-push tool entirely + flag read-only to the LLM |
+| `KA_ALLOW_CONFIG_READ` | permit `show running-config`/`tech-support` (still redacted); off by default |
+| `KA_DEFAULT_USERNAME` | shared SSH username for `discover_new_device` onboarding |
+| `KA_MAX_OUTPUT_CHARS` | inline output cap; larger output is captured for `read_output` (default 60000) |
+| `KA_CAPTURE_TTL_SECS` / `KA_CAPTURE_MAX` | captured-output lifetime + max concurrent captures |
 
 ## License
 
