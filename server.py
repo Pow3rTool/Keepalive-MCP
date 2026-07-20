@@ -21,7 +21,7 @@ Pool model:
 Auth:
   Every MCP call validates the Entra bearer (JWKS sig, audience, issuer, expiry,
   required scope, allowed client). Roles from the verified token gate access:
-    Keepalive.Read   → find_devices, run
+    Keepalive.Read   → find_devices, run (+ claim_session/release_session when KA_READONLY)
     Keepalive.Config → find_devices, run, apply, claim_session, release_session
 
   The status page (/status and /status.json) is gated behind an interactive Entra
@@ -148,6 +148,13 @@ _API_RESOURCE     = (os.environ.get("KA_AUDIENCE", "").strip() or f"api://{CLIEN
 API_SCOPE         = f"{_API_RESOURCE}/{REQUIRED_SCOPE}" if REQUIRED_SCOPE else ""
 READ_ROLES        = {"keepalive.read", "keepalive.config", "keepalive.admin"}
 CONFIG_ROLES      = {"keepalive.config", "keepalive.admin"}
+# Dedicated-session verbs (claim_session/release_session). A session hands out an EXCLUSIVE
+# connection but no new capability — apply is Config-gated (and unregistered in read-only)
+# and run refuses writes regardless — so in READ-ONLY mode these drop to the Read tier: a
+# read workflow that needs connection affinity (e.g. ASA `changeto` context navigation) can
+# hold a session without a Config role. Read-write keeps them Config-gated (paired with
+# apply). Kept in lockstep with _require_session below.
+SESSION_ROLES     = READ_ROLES if READONLY else CONFIG_ROLES
 # Device-pool mutation (REST /devices add/update/remove). Admin is a superset of
 # read+config: an operator who can reshape the fleet can also read and push config.
 ADMIN_ROLES       = {"keepalive.admin"}
@@ -425,6 +432,10 @@ def _require_config(ctx):
         return json.dumps({"error": "forbidden: Keepalive.Config role required"})
     return oid, upn, _session_id(ctx)
 
+# claim/release gate: Read tier in read-only mode (a session grants no write power),
+# Config tier otherwise. Kept in lockstep with SESSION_ROLES above.
+_require_session = _require_read if READONLY else _require_config
+
 def _require_admin(ctx):
     """Returns (oid, upn, session_id) or error JSON string. Keepalive.Admin only —
     for fleet-shaping verbs (discover_new_device). The MCP tool list is advertised to
@@ -449,8 +460,8 @@ _TOOL_VISIBILITY: dict[str, set[str]] = {
     "run":                 READ_ROLES,
     "read_output":         READ_ROLES,
     "apply":               CONFIG_ROLES,
-    "claim_session":       CONFIG_ROLES,
-    "release_session":     CONFIG_ROLES,
+    "claim_session":       SESSION_ROLES,
+    "release_session":     SESSION_ROLES,
     "discover_new_device": ADMIN_ROLES,
 }
 
@@ -1115,6 +1126,13 @@ _RO_BANNER = ("READ-ONLY MODE: this server only runs read commands "
               "(show/ping/traceroute/dir/verify) via `run`; configuration changes are "
               "disabled and the apply tool is not available — do not attempt to push config. "
               if READONLY else "")
+# Role sentence for the instructions — accurate per mode. In read-only the session verbs
+# are Read-tier (see SESSION_ROLES); in read-write they remain Config alongside apply.
+_SESSION_ROLE_NOTE = (
+    "In this read-only deployment claim_session/release_session are available to "
+    "Keepalive.Read for connection affinity (e.g. ASA `changeto` context navigation). "
+    if READONLY else
+    "A Keepalive.Config role additionally allows apply and session management. ")
 
 mcp = FastMCP(
     "keepalive-mcp",
@@ -1125,8 +1143,8 @@ mcp = FastMCP(
         "(show, ping, traceroute) and returns structured JSON when parsed=true; "
         "apply pushes config — confirm=false is a dry-run, confirm=true applies. "
         "claim_session reserves an exclusive connection for multi-command work; "
-        "release_session returns it. A Keepalive.Read role allows find_devices and run. "
-        "A Keepalive.Config role additionally allows apply and session management. "
+        "release_session returns it. A Keepalive.Read role allows find_devices and run. " +
+        _SESSION_ROLE_NOTE +
         "discover_new_device (Keepalive.Admin only) onboards a device by name + host. "
         "Large command output is auto-captured; read_output greps (pattern=) or pages "
         "(offset=/limit=) it by capture_id. For a known target, filter on the device first "
@@ -1514,7 +1532,7 @@ async def claim_session(ctx: Context, device: str) -> str:
     DEDICATED_TTL seconds of inactivity. Use release_session when done.
     If the device is already claimed, returns how long the holder has been idle
     and when it auto-expires so you can decide whether to retry."""
-    r = _require_config(ctx)
+    r = _require_session(ctx)
     if isinstance(r, str):
         return r
     oid, upn, mcp_sid = r
@@ -1530,7 +1548,7 @@ async def claim_session(ctx: Context, device: str) -> str:
 @mcp.tool()
 async def release_session(ctx: Context, session_id: str) -> str:
     """Release a dedicated session early (before the inactivity TTL). Good hygiene."""
-    r = _require_config(ctx)
+    r = _require_session(ctx)
     if isinstance(r, str):
         return r
     oid, upn, mcp_sid = r
