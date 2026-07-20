@@ -70,10 +70,34 @@ DEFAULT_USERNAME  = os.environ.get("KA_DEFAULT_USERNAME", "")
 # in tools/list, so the LLM can't see or call it — and tell the model up front that only
 # reads work. Use when the deployment (or the SSH service account) is read-only.
 READONLY          = os.environ.get("KA_READONLY", "").strip().lower() in ("1", "true", "yes", "on")
+# EXPERIMENTAL per-user tool discovery: when on, tools/list returns only the tools the
+# caller's Entra app roles can actually use — the roles are read from the SAME validated
+# bearer the call-time gates use. This is discoverability polish, NOT a new security
+# boundary: every tool still enforces its _require_* gate on call, so a client that names
+# an unlisted tool still gets the normal 403. Safe to cache per user because turnstone
+# pools OBO sessions per user_id — each user's filtered list is keyed under their own id,
+# so there's no cross-user cache poisoning. Default off (advertise-all + call-time gate).
+FILTER_TOOL_LIST  = os.environ.get("KA_FILTER_TOOL_LIST", "").strip().lower() in ("1", "true", "yes", "on")
 # Host-key policy for device SSH: "strict" (verify against known_hosts, reject
 # unknown/changed) or "off" (skip verification — MITM-exposed, bootstrap/lab only).
 SSH_HOSTKEY_POLICY = os.environ.get("KA_SSH_HOSTKEY_POLICY", "strict").strip().lower()
 SSH_KNOWN_HOSTS    = os.environ.get("KA_SSH_KNOWN_HOSTS", "/etc/keepalive-mcp/ssh/known_hosts")
+# Legacy SSH algorithm allowances for reaching old gear (old IOS-XR/IOS PEs that only
+# speak SHA-1). The pool's transport is asyncssh — a pure-Python client that does NOT use
+# the system `ssh` binary or /etc/ssh/ssh_config, and ships with SHA-1 KEX, the ssh-rsa
+# (SHA-1) host-key alg, CBC ciphers and hmac-sha1 DISABLED by default. So a device that
+# only offers those is unreachable until you opt them back in HERE — re-enabling them in
+# /etc/ssh/ssh_config only fixes the CLI, not this server. Each var is passed straight to
+# asyncssh.connect() and takes a comma-separated list with the same OpenSSH-style +/-/^
+# prefix: e.g. "+diffie-hellman-group14-sha1" APPENDS to the modern defaults, so modern
+# devices still negotiate modern algs and only a device offering nothing better falls back.
+# Empty = asyncssh stock defaults (modern only). Mirror, per var, whatever you re-enabled
+# in /etc/ssh/ssh_config for the CLI — note ssh-rsa host keys usually need KA_SSH_HOSTKEY_ALGS
+# too, not just KEX. group1-sha1 (1024-bit) is genuinely weak; prefer group14 and omit group1.
+SSH_KEX_ALGS       = os.environ.get("KA_SSH_KEX_ALGS", "").strip()          # kex_algs
+SSH_HOSTKEY_ALGS   = os.environ.get("KA_SSH_HOSTKEY_ALGS", "").strip()      # server_host_key_algs
+SSH_ENCRYPT_ALGS   = os.environ.get("KA_SSH_ENCRYPTION_ALGS", "").strip()   # encryption_algs
+SSH_MAC_ALGS       = os.environ.get("KA_SSH_MAC_ALGS", "").strip()          # mac_algs
 
 # With host-key verification off (the norm for a large, ever-changing device fleet where
 # seeding known_hosts isn't viable), scrapli logs "unable to resolve 'ssh_known_hosts' file"
@@ -415,6 +439,29 @@ def _require_admin(ctx):
     return oid, upn, _session_id(ctx)
 
 
+# ── per-user tools/list filtering (KA_FILTER_TOOL_LIST) ─────────────────────────
+# The role set that makes each tool USABLE — mirrors the _require_* gate inside each
+# tool EXACTLY. Consulted ONLY to decide what tools/list advertises; the gate, not this
+# map, is the boundary. Keep in lockstep with each tool's _require_* call (a drift check
+# in the tests asserts every registered tool appears here).
+_TOOL_VISIBILITY: dict[str, set[str]] = {
+    "find_devices":        READ_ROLES,
+    "run":                 READ_ROLES,
+    "read_output":         READ_ROLES,
+    "apply":               CONFIG_ROLES,
+    "claim_session":       CONFIG_ROLES,
+    "release_session":     CONFIG_ROLES,
+    "discover_new_device": ADMIN_ROLES,
+}
+
+def _filter_tools_for_roles(tools: list, roles: set[str]) -> list:
+    """Keep only tools whose required-role set intersects the caller's roles. An unknown
+    tool (not in _TOOL_VISIBILITY) defaults to the READ tier so a newly added read verb
+    is never silently hidden — over-showing is a UX bug, the call-time gate still guards
+    it. No roles (unauthenticated / role-less token) → empty list (fail closed)."""
+    return [t for t in tools if roles & _TOOL_VISIBILITY.get(t.name, READ_ROLES)]
+
+
 # ── device-management auth (REST /devices) ─────────────────────────────────────
 def _identity_mgmt(bearer: str) -> tuple[str, str, list[str]] | None:
     """Identity for the device-management REST API. Unlike _identity (built for
@@ -607,6 +654,18 @@ class Pool:
             auth_kwargs["auth_private_key"] = SSH_KEY
         if SSH_SECONDARY:
             auth_kwargs["auth_secondary"] = SSH_SECONDARY   # 'enable' after login
+        # asyncssh.connect() kwargs (via scrapli transport_options). Only the SSH transport
+        # keepalives are always set; the legacy-algorithm allowances are added ONLY when the
+        # operator opted in via env, so the default posture stays modern-only (see above).
+        asyncssh_opts: dict = {"keepalive_interval": 20, "keepalive_count_max": 3}
+        if SSH_KEX_ALGS:
+            asyncssh_opts["kex_algs"] = SSH_KEX_ALGS
+        if SSH_HOSTKEY_ALGS:
+            asyncssh_opts["server_host_key_algs"] = SSH_HOSTKEY_ALGS
+        if SSH_ENCRYPT_ALGS:
+            asyncssh_opts["encryption_algs"] = SSH_ENCRYPT_ALGS
+        if SSH_MAC_ALGS:
+            asyncssh_opts["mac_algs"] = SSH_MAC_ALGS
         try:
             sc = AsyncScrapli(
                 host=meta["host"], port=meta["port"],
@@ -615,10 +674,7 @@ class Pool:
                 platform=meta["platform"],
                 transport="asyncssh",
                 ssh_config_file=ssh_cfg,
-                transport_options={"asyncssh": {
-                    "keepalive_interval": 20,
-                    "keepalive_count_max": 3,
-                }},
+                transport_options={"asyncssh": asyncssh_opts},
                 timeout_socket=15, timeout_transport=15, timeout_ops=60,
                 **auth_kwargs)
             await sc.open()
@@ -1554,6 +1610,26 @@ async def discover_new_device(ctx: Context, name: str, host: str,
                  "added to inventory but not CONNECTED yet; the pool keeps retrying. "
                  "Check host/reachability and that the shared creds work on this device."),
     }, indent=2)
+
+
+# ── filtered tools/list (registered last, after every @mcp.tool() above) ───────
+# Override FastMCP's default list handler so tools/list is scoped to the caller's app
+# roles. We call FastMCP's own list_tools() to get the full, correctly-converted set,
+# then drop anything the caller's roles can't use. Reads identity from the same request
+# context the tools see (mcp.get_context() → _auth → validated Entra bearer). This is a
+# discoverability filter only — call_tool still dispatches every registered tool through
+# its _require_* gate, so an unlisted tool that's called anyway returns the usual 403.
+if FILTER_TOOL_LIST:
+    from mcp.types import Tool as _MCPTool
+
+    @mcp._mcp_server.list_tools()
+    async def _list_tools_filtered() -> list[_MCPTool]:
+        full  = await mcp.list_tools()             # full registry, FastMCP's own conversion
+        ident = _auth(mcp.get_context())           # (oid, upn, roles) after full JWT checks, or None
+        roles = set(ident[2]) if ident else set()  # no valid bearer → no roles → nothing listed
+        return _filter_tools_for_roles(full, roles)
+
+    print("[keepalive-mcp] per-user tools/list filtering ENABLED (KA_FILTER_TOOL_LIST)", flush=True)
 
 
 # ── status page (Starlette route) ─────────────────────────────────────────────
