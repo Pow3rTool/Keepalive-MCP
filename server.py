@@ -36,7 +36,7 @@ Platforms:
 
 Audit: every call → asyncpg INSERT into the keepalive.audit table (KA_DB_DSN).
 """
-import os, json, asyncio, time, difflib, re, fnmatch
+import os, json, asyncio, time, difflib, re, fnmatch, inspect
 import secrets, hashlib, base64, hmac
 from html import escape
 from urllib.parse import urlencode
@@ -840,41 +840,83 @@ class Pool:
         _next_reconnect: dict[str, float] = {}
         while self._running:
             await asyncio.sleep(KEEPALIVE_SECS)
-            for device, conns in list(self._conns.items()):
-                # held by a dedicated session — don't poke it
-                held = any(s.device == device for s in self._sessions.values())
+            # Poke every device CONCURRENTLY, swallowing per-device errors here
+            # (return_exceptions) so one bad device can never kill the task — a dead
+            # keepalive task means NOTHING reconnects for ANY device until a restart, a
+            # silent fleet-wide "stuck DOWN". Concurrency also keeps a tick's wall-time to
+            # the slowest single device instead of the sum, so a large fleet still finishes
+            # within KEEPALIVE_SECS.
+            await asyncio.gather(*[
+                self._keepalive_device(dev, conns, _next_reconnect)
+                for dev, conns in list(self._conns.items())
+            ], return_exceptions=True)
 
-                for conn in list(conns):
-                    if held:
-                        continue
+    async def _keepalive_device(self, device: str, conns: list,
+                                _next_reconnect: dict[str, float]):
+        # A dedicated session owns the device — never poke it.
+        if any(s.device == device for s in self._sessions.values()):
+            return
+        lock = self._locks.get(device)
+        if lock is None:
+            return
+        # If a run/apply holds the lock it's exercising the session right now — skip this
+        # tick rather than fight it for the channel.
+        if lock.locked():
+            return
+        await lock.acquire()
+        try:
+            for conn in list(conns):
+                try:
+                    await self._poke(conn)     # \t: resets exec-timeout AND proves the channel live
+                    conn.last_ok = time.time()
+                    conn.status  = "CONNECTED"
+                except Exception as e:
+                    conn.status   = "DOWN"
+                    conn.last_err = str(e)
                     try:
-                        # SSH transport keepalives (asyncssh) keep the session
-                        # alive at the protocol level. Here we just verify the
-                        # connection object is still in an alive state.
-                        if not conn.scrapli.isalive():
-                            raise Exception("transport reports not alive")
-                        conn.last_ok = time.time()
-                        conn.status  = "CONNECTED"
-                    except Exception as e:
-                        conn.status   = "DOWN"
-                        conn.last_err = str(e)
-                        conns.remove(conn)
-                        try:
-                            await conn.scrapli.close()
-                        except Exception:
-                            pass
-                        await _audit("pool", "pool", None, device,
-                                     "pool-disconnect", None, 1, str(e), 0, 0)
+                        conns.remove(conn)     # may already be gone (claim/reconcile raced) — ok
+                    except ValueError:
+                        pass
+                    try:
+                        await conn.scrapli.close()
+                    except Exception:
+                        pass
+                    await _audit("pool", "pool", None, device,
+                                 "pool-disconnect", None, 1, str(e), 0, 0)
+        finally:
+            lock.release()
 
-                # no connections and none held → try reconnect on timer
-                if not conns and not held:
-                    now = time.time()
-                    if now >= _next_reconnect.get(device, 0):
-                        _next_reconnect[device] = now + RECONNECT_WAIT
-                        conn = await self._open(device)
-                        if conn:
-                            conns.append(conn)
-                            _next_reconnect.pop(device, None)
+        # No connection left → reconnect on the backoff timer. Done OUTSIDE the lock; _open
+        # is serialized by the connect gate to protect the AAA/TACACS cluster.
+        if not conns:
+            now = time.time()
+            if now >= _next_reconnect.get(device, 0):
+                _next_reconnect[device] = now + RECONNECT_WAIT
+                conn = await self._open(device)
+                if conn:
+                    conns.append(conn)
+                    _next_reconnect.pop(device, None)
+
+    async def _poke(self, conn: "_Conn"):
+        """Send a bare TAB and drain the echo. The tab is channel activity that resets the
+        device's VTY exec-timeout — so the session isn't torn down and reconnected every few
+        minutes — and, unlike a newline, executes nothing and is safe even if the session is
+        parked at a --More-- or reload-confirm prompt. A write/read failure here means the
+        channel is actually dead (which a transport-only isalive() misses), so the caller
+        reconnects. Draining the echo (prompt redisplay on IOS-XR, command completion on
+        NX-OS) keeps scrapli's read buffer clean for the next real command."""
+        if not conn.scrapli.isalive():
+            raise Exception("transport reports not alive")
+        ch = conn.scrapli.channel
+        w = ch.write("\t")
+        if inspect.isawaitable(w):
+            await w
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                await asyncio.wait_for(ch.read(), timeout=0.4)
+            except asyncio.TimeoutError:
+                break              # channel quiet → fully drained
 
     # ── session reaper ───────────────────────────────────────────────
     async def _session_reaper(self):
@@ -945,6 +987,29 @@ class Pool:
             lock.release()
             return None
         return conns[0], lock
+
+    async def replace_dead(self, device: str, dead: "_Conn"):
+        """Caller holds the borrow lock: evict a connection that just failed mid-command
+        and open a fresh one in its place. Returns the new (pooled) _Conn, or None if the
+        reopen failed. Lets run recover transparently when a warm connection's channel died
+        while idle (device closed the exec session on its VTY exec-timeout) instead of
+        surfacing 'Channel not open for sending' to the caller."""
+        conns = self._conns.get(device)
+        if conns is not None:
+            try:
+                conns.remove(dead)
+            except ValueError:
+                pass
+        try:
+            await dead.scrapli.close()
+        except Exception:
+            pass
+        await _audit("pool", "pool", None, device, "pool-disconnect", None, 1,
+                     "dead channel on use — reconnecting", 0, 0)
+        new = await self._open(device)
+        if new is not None:
+            self._conns.setdefault(device, []).append(new)
+        return new
 
     # ── claim (dedicated session) ────────────────────────────────────
     async def claim(self, device: str, mcp_session_id: str, oid: str) -> dict:
@@ -1211,6 +1276,18 @@ async def find_devices(ctx: Context, query: str = "", role: str = "",
     return json.dumps(out, indent=2)
 
 
+def _is_dead_channel(exc: Exception) -> bool:
+    """True when an exception raised BY send_command looks like a dead SSH channel or
+    transport (device closed the exec session, connection lost/reset, EOF) rather than a
+    device-side command problem — scrapli returns command errors in the result, it does not
+    raise them. These are the cases run can safely reconnect-and-retry once."""
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "channel not open", "not open for sending", "connection lost",
+        "connection closed", "connection reset", "reset by peer", "broken pipe",
+        "eof received", "not connected", "channel closed"))
+
+
 @mcp.tool()
 async def run(ctx: Context, device: str, command: str,
               parsed: bool = False, session_id: str | None = None,
@@ -1261,7 +1338,21 @@ async def run(ctx: Context, device: str, command: str,
                                    "reason": "no connection available"})
             conn_obj, lock = borrowed
 
-        resp = await conn_obj.scrapli.send_command(cmd)
+        try:
+            resp = await conn_obj.scrapli.send_command(cmd)
+        except Exception as send_err:
+            # A warm POOLED connection can go stale between uses: the device closes the exec
+            # session on its VTY exec-timeout while the transport still looks alive, so the
+            # next send hits a dead channel ("Channel not open for sending"). Reconnect once
+            # and retry. A DEDICATED session carries per-caller state (ASA context / candidate
+            # config) we must not silently rebuild — surface the error instead of retrying.
+            if dedicated or not _is_dead_channel(send_err):
+                raise
+            conn_obj = await pool.replace_dead(device, conn_obj)
+            if conn_obj is None:
+                raise Exception(f"{device}: connection died mid-command and could not be "
+                                f"reopened ({send_err})")
+            resp = await conn_obj.scrapli.send_command(cmd)
         raw = _redact_secrets(resp.result or "")     # redact the RAW device text first
         if parsed:
             try:
