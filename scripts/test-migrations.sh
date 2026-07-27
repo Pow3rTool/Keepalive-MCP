@@ -68,6 +68,9 @@ test "$migration_count" = "$expected_migrations"
 
 # Runtime comes ready with an empty fleet; it must not wait for SSH convergence.
 "$PODMAN" run -d --name "$runtime_name" --network "$network_name" \
+  --user 993:985 \
+  --security-opt no-new-privileges \
+  --cap-drop all \
   -e KA_DB_DSN="$dsn" \
   -e KA_TENANT_ID=00000000-0000-0000-0000-000000000000 \
   -e KA_CLIENT_ID=11111111-1111-1111-1111-111111111111 \
@@ -130,7 +133,11 @@ sleep 1
 "$PODMAN" stop --time 8 "$runtime_name" >/dev/null
 wait "$slow_client_pid" >/dev/null 2>&1 || true
 runtime_exit="$("$PODMAN" inspect "$runtime_name" --format "{{.State.ExitCode}}")"
-test "$runtime_exit" = 0
+if [ "$runtime_exit" != 0 ]; then
+  "$PODMAN" logs "$runtime_name" >&2
+  echo "runtime exited $runtime_exit during bounded shutdown" >&2
+  exit 1
+fi
 "$PODMAN" rm "$runtime_name" >/dev/null
 
 # Validate the real trigger and audit table from the exact runtime dependency set.

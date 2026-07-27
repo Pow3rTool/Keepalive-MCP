@@ -2620,9 +2620,40 @@ def _build_app():
     return app
 
 
-if __name__ == "__main__":
+def _run_server() -> None:
+    """Run Uvicorn with a narrow workaround for restricted non-root PID 1.
+
+    Uvicorn deliberately replays a captured termination signal after its graceful
+    lifespan cleanup. On the lab's capability-free Podman user mapping, the kernel
+    returns EACCES/EPERM when PID 1 signals itself. Suppress only that post-cleanup
+    replay; permission failures from startup or request handling still propagate.
+    """
+    import errno
     import uvicorn
-    uvicorn.run(
+    from contextlib import contextmanager
+
+    class _RestrictedPidOneServer(uvicorn.Server):
+        @contextmanager
+        def capture_signals(self):
+            serve_completed = False
+            try:
+                with super().capture_signals():
+                    yield
+                    serve_completed = True
+            except PermissionError as exc:
+                if not (
+                    serve_completed
+                    and os.getpid() == 1
+                    and exc.errno in (errno.EACCES, errno.EPERM)
+                ):
+                    raise
+                print(
+                    "[keepalive-mcp] graceful shutdown complete; restricted PID 1 "
+                    "could not replay its termination signal",
+                    flush=True,
+                )
+
+    config = uvicorn.Config(
         _build_app(),
         host=BIND,
         port=PORT,
@@ -2630,3 +2661,8 @@ if __name__ == "__main__":
         access_log=ACCESS_LOG,
         timeout_graceful_shutdown=SHUTDOWN_GRACE_SECS,
     )
+    _RestrictedPidOneServer(config).run()
+
+
+if __name__ == "__main__":
+    _run_server()
