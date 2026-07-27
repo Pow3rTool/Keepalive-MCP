@@ -39,14 +39,15 @@ Audit: every call → asyncpg INSERT into the keepalive.audit table (KA_DB_DSN).
 import os, json, asyncio, time, difflib, re, fnmatch, inspect
 import secrets, hashlib, base64, hmac
 from html import escape
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import urlencode, urlparse
 import asyncpg
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from scrapli import AsyncScrapli
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 os.umask(0o077)
@@ -131,6 +132,18 @@ SESSION_SECRET    = os.environ.get("KA_SESSION_SECRET", "") or secrets.token_hex
 KEY_PATH          = os.environ.get("KA_CERT_KEY_PATH", "/etc/keepalive-mcp/keepalive-mcp.key")
 CERT_PATH         = os.environ.get("KA_CERT_PATH",     "/etc/keepalive-mcp/keepalive-mcp.crt")
 REDIRECT_URI      = os.environ.get("KA_REDIRECT_URI", "").strip()   # required; no host default
+
+
+def _public_prefix_from_redirect_uri(uri: str) -> str:
+    """Return the reverse-proxy path prefix implied by the OAuth callback URL."""
+    path = urlparse(uri).path.rstrip("/")
+    callback_suffix = "/auth/callback"
+    if path.endswith(callback_suffix):
+        path = path[:-len(callback_suffix)]
+    return path.rstrip("/")
+
+
+PUBLIC_PATH_PREFIX = _public_prefix_from_redirect_uri(REDIRECT_URI)
 
 TENANT            = os.environ.get("KA_TENANT_ID", "").strip()
 CLIENT_ID         = os.environ.get("KA_CLIENT_ID", "").strip()
@@ -1742,6 +1755,41 @@ if FILTER_TOOL_LIST:
 
 
 # ── status page (Starlette route) ─────────────────────────────────────────────
+_STATIC_DIR = Path(__file__).with_name("static")
+_FAVICON_ASSETS = {
+    "/android-chrome-192x192.png": ("android-chrome-192x192.png", "image/png"),
+    "/android-chrome-512x512.png": ("android-chrome-512x512.png", "image/png"),
+    "/apple-touch-icon.png":       ("apple-touch-icon.png", "image/png"),
+    "/favicon-16x16.png":          ("favicon-16x16.png", "image/png"),
+    "/favicon-32x32.png":          ("favicon-32x32.png", "image/png"),
+    "/favicon.ico":                ("favicon.ico", "image/x-icon"),
+    "/site.webmanifest":           ("site.webmanifest", "application/manifest+json"),
+}
+
+
+def _asset_url(filename: str) -> str:
+    return f"{PUBLIC_PATH_PREFIX}/{filename}"
+
+
+_FAVICON_HEAD = (
+    f'<link rel="apple-touch-icon" sizes="180x180" href="{_asset_url("apple-touch-icon.png")}">'
+    f'<link rel="icon" type="image/png" sizes="32x32" href="{_asset_url("favicon-32x32.png")}">'
+    f'<link rel="icon" type="image/png" sizes="16x16" href="{_asset_url("favicon-16x16.png")}">'
+    f'<link rel="icon" href="{_asset_url("favicon.ico")}">'
+    f'<link rel="manifest" href="{_asset_url("site.webmanifest")}">'
+    '<meta name="theme-color" content="#0c1117">'
+)
+
+
+async def favicon_asset(request: Request):
+    filename, media_type = _FAVICON_ASSETS[request.url.path]
+    return FileResponse(
+        _STATIC_DIR / filename,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 _STATUS_CSS = """
 body{font-family:system-ui,-apple-system,sans-serif;background:#0c1117;color:#d8e4f0;
      margin:0;padding:32px}
@@ -1761,6 +1809,18 @@ td{padding:9px 12px;border-bottom:1px solid #1c2638;vertical-align:top}
 .amber{background:rgba(212,160,23,.1); color:#d4a017;border:1px solid rgba(212,160,23,.2)}
 .red  {background:rgba(196,80,80,.12); color:#c45050;border:1px solid rgba(196,80,80,.25)}
 """
+
+
+def _status_document(body: str, title: str = "Keepalive MCP · status") -> str:
+    return (
+        "<!doctype html><html lang='en'><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{escape(title)}</title>{_FAVICON_HEAD}"
+        f"<style>{_STATUS_CSS}</style>"
+        f"</head><body>{body}</body></html>"
+    )
+
 
 # ── browser session (PKCE OIDC for status page) ──────────────────────────────
 _oauth_states: dict[str, tuple[str, float]] = {}   # state token → (PKCE verifier, created_at)
@@ -1978,8 +2038,12 @@ async def status_page(request: Request):
         return _login_redirect(request)
     if not _status_authorized(request):
         return HTMLResponse(
-            f"<h1>keepalive-mcp</h1><p>Forbidden — the '{escape(STATUS_ROLE)}' "
-            f"app role is required to view status.</p>", status_code=403)
+            _status_document(
+                f"<h1>keepalive-mcp</h1><p>Forbidden — the '{escape(STATUS_ROLE)}' "
+                "app role is required to view status.</p>"
+            ),
+            status_code=403,
+        )
     rows = pool.status_data()
     now  = int(time.time())
     trs  = ""
@@ -1999,17 +2063,18 @@ async def status_page(request: Request):
                 f"<td style='color:#5c6e84;font-family:monospace;font-size:12px'>{age_s}</td>"
                 f"</tr>")
 
-    html = (f"<style>{_STATUS_CSS}</style>"
-            f"<h1>keepalive-mcp</h1>"
-            f"<div class='sub'>network gear connection pool · {len(rows)} devices</div>"
-            f"<table>"
-            f"<thead><tr>"
-            f"<th>device</th><th>host</th><th>platform</th>"
-            f"<th>role</th><th>site</th><th>state</th>"
-            f"<th>pool+sessions</th><th>last ok</th>"
-            f"</tr></thead>"
-            f"<tbody>{trs}</tbody>"
-            f"</table>")
+    html = _status_document(
+        f"<h1>keepalive-mcp</h1>"
+        f"<div class='sub'>network gear connection pool · {len(rows)} devices</div>"
+        f"<table>"
+        f"<thead><tr>"
+        f"<th>device</th><th>host</th><th>platform</th>"
+        f"<th>role</th><th>site</th><th>state</th>"
+        f"<th>pool+sessions</th><th>last ok</th>"
+        f"</tr></thead>"
+        f"<tbody>{trs}</tbody>"
+        f"</table>"
+    )
     return HTMLResponse(html)
 
 
@@ -2231,6 +2296,7 @@ def _build_app():
     app = Starlette(
         lifespan=lifespan,
         routes=[
+            *[Route(path, favicon_asset) for path in _FAVICON_ASSETS],
             Route("/status",          status_page),
             Route("/status.json",     status_json),
             Route("/auth/callback",   auth_callback),
