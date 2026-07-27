@@ -42,6 +42,7 @@ CREATE TRIGGER trg_devices_notify
 -- granted writes — so the REST /devices API (and any hot add/remove) fails with
 -- "permission denied". Grant table writes AND usage on the identity sequence
 -- (a table INSERT grant alone still fails on the serial default). Run as the
--- table owner (postgres). Adjust the role name if your KA_DB_DSN user differs.
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE devices TO keepalive;
-GRANT USAGE, SELECT ON SEQUENCE devices_id_seq TO keepalive;
+-- table owner. CURRENT_USER keeps this migration portable when the deployment's
+-- application role is not literally named "keepalive".
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE devices TO CURRENT_USER;
+GRANT USAGE, SELECT ON SEQUENCE devices_id_seq TO CURRENT_USER;

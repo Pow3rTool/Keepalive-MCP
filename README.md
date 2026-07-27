@@ -79,6 +79,15 @@ host/role/site topology is treated as sensitive internal detail, not public.
 Every call writes an audit row (`asyncpg` → `keepalive.audit`). Command *output* is
 never stored — only a character count.
 
+## Health and fleet convergence
+
+`/livez` is process liveness. `/readyz` becomes ready after the authoritative
+inventory has loaded and the background supervisors have started. It intentionally
+does **not** wait for every device to connect: large fleets warm asynchronously, and
+the readiness response exposes only aggregate `total`/`connected`/`claimed`/`down`
+counts. An individual device can return `device_down` while its slot is still warming
+without taking the service out of rotation.
+
 ## Architecture
 
 ```
@@ -120,20 +129,20 @@ kadev remove <name>
 
 ## Quick start
 
-1. **Install** (Python 3.11+):
+1. **Install** (Python 3.12):
    ```
-   python -m venv venv && ./venv/bin/pip install -r requirements.txt
+   python -m venv venv && ./venv/bin/pip install -r requirements.lock
    ```
 2. **Configure.** Copy [`.env.example`](.env.example) and fill it in — Entra tenant/
    client/audience, `KA_DB_DSN`, SSH key + known_hosts. Every setting is documented
    inline in that file.
-3. **Create the DB schema** (base tables first), then apply the notify trigger:
+3. **Apply the DB schema** with the checksum-protected migration runner:
    ```
-   psql "$KA_DB_DSN" -f deploy/migrations/000_schema.sql
-   psql "$KA_DB_DSN" -f deploy/migrations/001_devices_notify.sql
+   KA_DB_DSN="$KA_DB_DSN" ./venv/bin/python migrate.py
    ```
-   `000` creates the `devices` and `audit` tables (+ the `devices_id_seq` that `001`
-   grants on); run it as the role that owns the DB so no cross-owner grants are needed.
+   Applied versions and SHA-256 checksums are recorded in
+   `keepalive_schema_migrations`. Re-running is safe; editing an already-applied
+   migration fails closed.
 4. **Seed SSH host keys** (required under the default `strict` host-key policy):
    ```
    ssh-keyscan -f <device-hosts> > /etc/keepalive-mcp/ssh/known_hosts
@@ -144,6 +153,22 @@ kadev remove <name>
 
 The server **fails closed at startup** if required config is missing (e.g. no
 `KA_REDIRECT_URI`, or an empty `known_hosts` under `strict`).
+
+## Verification and release gate
+
+Tests live under [`tests/`](tests). The candidate-image checks compile the packaged
+runtime, run Ruff correctness rules, enforce the coverage ratchet, and execute the
+full suite:
+
+```
+scripts/test-image.sh <candidate-image>
+```
+
+[`scripts/test-migrations.sh`](scripts/test-migrations.sh) starts a disposable
+PostgreSQL instance and verifies fresh and legacy upgrades, migration idempotency,
+`LISTEN`/`NOTIFY`, audit writes, zero-device readiness, and graceful container
+shutdown. The fleet `build-push.sh` runs both scripts against the exact image before
+publishing either its immutable tag or `latest`.
 
 ## Configuration
 
@@ -159,6 +184,7 @@ for the authoritative, commented list. Notable knobs:
 | `KA_ALLOWED_CLIENTS` | appids permitted to call the API |
 | `KA_REQUIRED_SCOPE` / `KA_STATUS_ROLE` | delegated scope and status-page role |
 | `KA_BIND` / `KA_PORT` | listen address (default `127.0.0.1:8784`) |
+| `KA_SHUTDOWN_GRACE_SECS` / `KA_CONNECTION_CLOSE_SECS` / `KA_BACKGROUND_DRAIN_SECS` | bound HTTP drain, concurrent SSH close, and pending-audit drain during shutdown |
 | `KA_KEEPALIVE_SECS` / `KA_DEDICATED_TTL_SECS` | pool tuning |
 | `KA_READONLY` | hide the `apply` config-push tool entirely + flag read-only to the LLM |
 | `KA_ALLOW_CONFIG_READ` | permit `show running-config`/`tech-support` (still redacted); off by default |

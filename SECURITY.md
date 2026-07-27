@@ -71,3 +71,7 @@ it is gated behind `Keepalive.Read` and audited.
 - The audit DB (`keepalive.audit`) stores config lines that may include secrets
   (e.g. `snmp community`, `username secret`, PSKs). Ensure storage-layer encryption
   and tight access on that database. Command *output* is not stored — only char counts.
+- `/livez` and `/readyz` are intentionally unauthenticated for orchestrator probes,
+  but expose only process state and aggregate device counts—never device names, hosts,
+  roles, sites, commands, principals, or audit content. Readiness does not wait for
+  every device to connect.

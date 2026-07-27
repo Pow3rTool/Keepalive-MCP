@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the browser icon assets and their public routes."""
+"""Tests for browser icon assets and their public routes."""
 import json
 import os
 

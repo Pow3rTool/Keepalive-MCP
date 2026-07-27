@@ -6,6 +6,8 @@ __pycache__/
 .env
 etc/
 ssh/
-deploy/
+deploy/*.service
 *.bak.*
 .pytest_cache/
+.coverage
+htmlcov/

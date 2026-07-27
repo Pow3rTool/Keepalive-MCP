@@ -1,3 +1,6 @@
+# Direct runtime requirements. The Docker image installs requirements.lock,
+# which contains the fully resolved Python 3.12 closure. Regenerate that lock
+# after changing this file and validate it with scripts/test-image.sh.
 mcp==1.28.1
 scrapli[asyncssh]==2025.1.30
 scrapli-community==2025.1.30

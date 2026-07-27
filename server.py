@@ -36,8 +36,18 @@ Platforms:
 
 Audit: every call → asyncpg INSERT into the keepalive.audit table (KA_DB_DSN).
 """
-import os, json, asyncio, time, difflib, re, fnmatch, inspect
-import secrets, hashlib, base64, hmac
+import asyncio
+import base64
+import difflib
+import fnmatch
+import hashlib
+import hmac
+import inspect
+import json
+import os
+import re
+import secrets
+import time
 from html import escape
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -48,7 +58,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from scrapli import AsyncScrapli
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
 
 os.umask(0o077)
 
@@ -127,6 +136,11 @@ CONNECT_RATE      = float(os.environ.get("KA_CONNECT_RATE", "1.0"))
 # KA_ACCESS_LOG=true for a debugging session; the redaction filter still scrubs
 # code/state/token/secret from any access line that IS emitted.
 ACCESS_LOG        = os.environ.get("KA_ACCESS_LOG", "false").strip().lower() in ("1", "true", "yes")
+# Bound process shutdown so a long-lived MCP request or a slow SSH transport cannot
+# make Podman/systemd wait forever. Device connections are closed concurrently below.
+SHUTDOWN_GRACE_SECS = int(os.environ.get("KA_SHUTDOWN_GRACE_SECS", "3"))
+CONNECTION_CLOSE_SECS = float(os.environ.get("KA_CONNECTION_CLOSE_SECS", "2"))
+BACKGROUND_DRAIN_SECS = float(os.environ.get("KA_BACKGROUND_DRAIN_SECS", "2"))
 
 SESSION_SECRET    = os.environ.get("KA_SESSION_SECRET", "") or secrets.token_hex(32)
 KEY_PATH          = os.environ.get("KA_CERT_KEY_PATH", "/etc/keepalive-mcp/keepalive-mcp.key")
@@ -186,8 +200,10 @@ COMMIT_CAP = {"cisco_iosxr", "arista_eos", "juniper_junos"}
 # Widen (e.g. cisco_ios, cisco_nxos) if a device outside this set needs tool onboarding.
 _ONBOARD_PLATFORMS = {"cisco_iosxe", "cisco_iosxr", "cisco_asa"}
 
-READ_OK = ("show", "ping", "traceroute", "dir", "display", "more", "get", "verify",
-           "changeto")   # ASA multi-context navigation (changeto context/system) — read-safe
+READ_OK = frozenset({
+    "show", "ping", "traceroute", "dir", "display", "get", "verify",
+    "changeto",  # ASA multi-context navigation (changeto context/system) — read-safe
+})
 
 # Config / tech-support dumps — the dense secret source. Blocked BY DEFAULT (line-based
 # redaction misses too many vendor variants on a full config — GPT #6); set
@@ -207,10 +223,11 @@ _BLOCKED_CONFIG = [re.compile(p, re.I) for p in (
 _BLOCKED_ALWAYS = [re.compile(p, re.I) for p in (
     r"\bcrypto\s+key\b",                         # show crypto key ... (private keys)
     r"\bkey\s+(chain|zeroize|mypubkey)\b",
-    r"\bmore\b.*(:|/)",                          # more nvram:/flash:/system: arbitrary file read
+    r"\bmore\b",                                 # file pager; arbitrary file read
     r"\btype\b\s+\S",                            # type <file>
     r"\b(dir|fsck|show\s+file)\b.*(nvram|flash|bootflash|disk\d|usb)",
     r"\bshow\b.*\bkey(s)?\b",                    # show ... keys (SNMPv3, EIGRP auth, etc.)
+    r"\|\s*(?:append|file|redirect|save|tee)\b",  # output redirection / file write
 )]
 
 # Redaction for the output that IS returned (targeted shows, apply diffs). Each rule
@@ -241,6 +258,25 @@ def _blocked_read(cmd: str) -> str:
                         "enable them with KA_ALLOW_CONFIG_READ=true (output stays secret-redacted); "
                         "until then use a targeted 'show' for the specific state you need.")
     return ""
+
+
+def _read_command_error(command: str) -> str:
+    """Validate that run() received exactly one read-only CLI command."""
+    cmd = command.strip()
+    if not cmd:
+        return "no command provided"
+    if any(marker in cmd for marker in ("\r", "\n", "\x00", ";")):
+        return "multiple commands and CLI control characters are refused"
+    blocked = _blocked_read(cmd)
+    if blocked:
+        return blocked
+    verb = cmd.split(maxsplit=1)[0].lower()
+    if verb not in READ_OK:
+        hint = ("this server is read-only — only show/ping/traceroute/dir/verify are permitted"
+                if READONLY else "use apply to push config")
+        return f"'{verb}' is not a read-only command; {hint}"
+    return ""
+
 
 def _redact_secrets(text: str) -> str:
     """Mask the secret VALUE on any line that carries one, keeping the directive
@@ -295,6 +331,11 @@ def _check_config():
         raise SystemExit("KA_REDIRECT_URI is required (no host default is baked in).")
     if SSH_HOSTKEY_POLICY not in ("strict", "off"):
         raise SystemExit("KA_SSH_HOSTKEY_POLICY must be strict|off.")
+    if (SHUTDOWN_GRACE_SECS < 1 or CONNECTION_CLOSE_SECS <= 0
+            or BACKGROUND_DRAIN_SECS <= 0):
+        raise SystemExit(
+            "KA_SHUTDOWN_GRACE_SECS must be >= 1 and "
+            "KA_CONNECTION_CLOSE_SECS/KA_BACKGROUND_DRAIN_SECS must be > 0.")
     if SSH_HOSTKEY_POLICY == "strict":
         try:
             seeded = os.path.getsize(SSH_KNOWN_HOSTS) > 0
@@ -321,6 +362,42 @@ _check_config()
 
 # ── database ──────────────────────────────────────────────────────────────────
 _db: asyncpg.Pool | None = None
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coroutine, name: str) -> asyncio.Task:
+    """Track finite audit work so shutdown can drain it instead of losing rows."""
+    task = asyncio.create_task(coroutine, name=name)
+    _background_tasks.add(task)
+
+    def _done(completed: asyncio.Task):
+        _background_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            print(f"[keepalive-mcp] background task {name} failed: {error}",
+                  flush=True)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _drain_background_tasks() -> None:
+    tasks = list(_background_tasks)
+    if not tasks:
+        return
+    _done, pending = await asyncio.wait(
+        tasks,
+        timeout=BACKGROUND_DRAIN_SECS,
+    )
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 async def _db_pool() -> asyncpg.Pool:
     global _db
@@ -383,8 +460,8 @@ def _jwks():
             f"https://login.microsoftonline.com/{TENANT}/discovery/v2.0/keys")
     return _jwks_client
 
-def _identity(bearer: str) -> tuple[str, str, list[str]] | None:
-    """Returns (oid, upn, roles) after full cryptographic validation, or None."""
+def _validated_token_claims(bearer: str, *, allow_app_only: bool) -> dict | None:
+    """Decode a bearer and enforce the common issuer/tenant/audience/client gates."""
     if not (bearer and TENANT and CLIENT_ID and REQUIRED_SCOPE and ALLOWED_CLIENTS):
         return None
     try:
@@ -398,16 +475,28 @@ def _identity(bearer: str) -> tuple[str, str, list[str]] | None:
             return None
         if claims.get("tid") != TENANT:
             return None
-        if REQUIRED_SCOPE not in str(claims.get("scp", "")).split():
-            return None
         if (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
             return None
-        oid  = claims.get("oid") or claims.get("sub") or "?"
-        upn  = claims.get("preferred_username") or claims.get("upn") or oid
-        roles = [str(r).lower() for r in (claims.get("roles") or [])]
-        return oid, upn, roles
+        scopes = str(claims.get("scp", "")).split() if claims.get("scp") else []
+        if allow_app_only:
+            if scopes and REQUIRED_SCOPE not in scopes:
+                return None
+        elif REQUIRED_SCOPE not in scopes:
+            return None
+        return claims
     except Exception:
         return None
+
+
+def _identity(bearer: str) -> tuple[str, str, list[str]] | None:
+    """Returns (oid, upn, roles) after delegated-token validation, or None."""
+    claims = _validated_token_claims(bearer, allow_app_only=False)
+    if claims is None:
+        return None
+    oid = claims.get("oid") or claims.get("sub") or "?"
+    upn = claims.get("preferred_username") or claims.get("upn") or oid
+    roles = [str(role).lower() for role in (claims.get("roles") or [])]
+    return oid, upn, roles
 
 def _bearer(ctx) -> str:
     try:
@@ -501,36 +590,14 @@ def _identity_mgmt(bearer: str) -> tuple[str, str, list[str]] | None:
     The signature/issuer/tenant/audience/ALLOWED_CLIENTS(azp|appid) gates apply to
     both; the caller then checks roles against ADMIN_ROLES.
     NOTE: the calling app/SP appid must be in KA_ALLOWED_CLIENTS."""
-    if not (bearer and TENANT and CLIENT_ID and ALLOWED_CLIENTS):
+    claims = _validated_token_claims(bearer, allow_app_only=True)
+    if claims is None:
         return None
-    try:
-        import jwt
-        key = _jwks().get_signing_key_from_jwt(bearer).key
-        claims = jwt.decode(bearer, key, algorithms=["RS256"], audience=AUDIENCE,
-                            options={"require": ["exp"], "verify_aud": True})
-        if claims.get("iss") not in (
-                f"https://login.microsoftonline.com/{TENANT}/v2.0",
-                f"https://sts.windows.net/{TENANT}/"):
-            return None
-        if claims.get("tid") != TENANT:
-            return None
-        if (claims.get("azp") or claims.get("appid")) not in ALLOWED_CLIENTS:
-            return None
-        scp = str(claims.get("scp", "")).split()
-        # Delegated tokens carry a scope (scp); app-only client-credentials tokens
-        # carry none — their authz rides the roles claim (checked by the caller).
-        # idtyp is optional and Entra often omits it, so absence-of-scp is the
-        # reliable app-only signal; a wrong-app token is already rejected above by
-        # the azp/appid ALLOWED_CLIENTS gate.
-        if scp and REQUIRED_SCOPE not in scp:
-            return None                          # delegated token with the wrong scope
-        oid   = claims.get("oid") or claims.get("sub") or "?"
-        upn   = (claims.get("preferred_username") or claims.get("upn")
-                 or f"app:{claims.get('azp') or claims.get('appid')}")
-        roles = [str(r).lower() for r in (claims.get("roles") or [])]
-        return oid, upn, roles
-    except Exception:
-        return None
+    oid = claims.get("oid") or claims.get("sub") or "?"
+    upn = (claims.get("preferred_username") or claims.get("upn")
+           or f"app:{claims.get('azp') or claims.get('appid')}")
+    roles = [str(role).lower() for role in (claims.get("roles") or [])]
+    return oid, upn, roles
 
 
 def _bearer_req(request) -> str:
@@ -618,8 +685,11 @@ class Pool:
         self._locks:       dict[str, asyncio.Lock]  = {}
         self._sessions:    dict[str, _Session]       = {}
         self._meta:        dict[str, dict]            = {}
-        self._tasks:       list[asyncio.Task]         = []
+        self._tasks:       dict[str, asyncio.Task]    = {}
+        self._transient_tasks: set[asyncio.Task]      = set()
         self._running      = False
+        self._inventory_loaded = False
+        self._listener_connected = False
         # Devices whose removal/disable arrived while a dedicated session held them.
         # We refuse to yank a live session; the release path drains them (below).
         self._pending_removal: set[str]              = set()
@@ -627,33 +697,129 @@ class Pool:
     # ── startup / shutdown ───────────────────────────────────────────
     async def start(self):
         self._running = True
+        self._inventory_loaded = False
         devices = await _load_devices()
         for d in devices:
             self._meta[d["name"]] = d
             self._locks[d["name"]] = asyncio.Lock()
             self._conns[d["name"]] = []
+        self._inventory_loaded = True
         # Initial connects run in the BACKGROUND: with the connect throttle enabled a
         # cold start warms devices at CONNECT_RATE/sec, so blocking here would delay app
         # readiness by ~(device count / rate) seconds. Instead we become ready at once
         # and warm up in the background; a call for a not-yet-warm device gets the normal
         # "device_down" until its slot comes up (PEs/important devices warm first by list
         # order). The keepalive loop retries any that fail.
-        self._tasks.append(asyncio.create_task(
-            self._initial_warmup([d["name"] for d in devices])))
-        self._tasks.append(asyncio.create_task(self._keepalive_loop()))
-        self._tasks.append(asyncio.create_task(self._session_reaper()))
-        self._tasks.append(asyncio.create_task(self._listen_devices()))
+        self._spawn_transient(
+            self._initial_warmup([d["name"] for d in devices]),
+            "initial-warmup",
+        )
+        self._tasks = {
+            "keepalive": asyncio.create_task(
+                self._keepalive_loop(), name="keepalive-loop"),
+            "session_reaper": asyncio.create_task(
+                self._session_reaper(), name="session-reaper"),
+            "device_listener": asyncio.create_task(
+                self._listen_devices(), name="device-listener"),
+        }
 
     async def stop(self):
         self._running = False
-        for t in self._tasks:
+        self._listener_connected = False
+        tasks = [*self._tasks.values(), *self._transient_tasks]
+        for t in tasks:
             t.cancel()
-        for conns in self._conns.values():
-            for c in conns:
-                try:
-                    await c.scrapli.close()
-                except Exception:
-                    pass
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Dedicated sessions are deliberately outside _conns, so include both and
+        # deduplicate by object identity. Close concurrently: production fleets may
+        # contain thousands of devices and shutdown must not be O(fleet size).
+        managed = [
+            conn
+            for conns in self._conns.values()
+            for conn in conns
+        ] + [session.conn for session in self._sessions.values()]
+        unique = {id(conn): conn for conn in managed}.values()
+
+        async def _close(conn: _Conn):
+            try:
+                await asyncio.wait_for(
+                    conn.scrapli.close(),
+                    timeout=CONNECTION_CLOSE_SECS,
+                )
+            except (Exception, asyncio.CancelledError):
+                pass
+
+        await asyncio.gather(*[_close(conn) for conn in unique])
+
+        self._tasks.clear()
+        self._transient_tasks.clear()
+        self._sessions.clear()
+        self._conns.clear()
+        self._locks.clear()
+        self._meta.clear()
+        self._pending_removal.clear()
+        self._inventory_loaded = False
+
+    def _spawn_transient(self, coroutine, name: str) -> asyncio.Task:
+        """Track finite pool work so shutdown can cancel and await it cleanly."""
+        task = asyncio.create_task(coroutine, name=name)
+        self._transient_tasks.add(task)
+
+        def _done(completed: asyncio.Task):
+            self._transient_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                print(f"[keepalive-mcp] background task {name} failed: {error}",
+                      flush=True)
+
+        task.add_done_callback(_done)
+        return task
+
+    def health_snapshot(self) -> tuple[bool, dict]:
+        """Return control-plane readiness and non-sensitive convergence counts.
+
+        Readiness intentionally does NOT depend on every device being connected.
+        Large fleets warm in the background; an individual device may return
+        device_down until its slot converges.
+        """
+        failed_tasks = sorted(
+            name for name, task in self._tasks.items()
+            if task.done() and not task.cancelled()
+        )
+        ready = self._running and self._inventory_loaded and not failed_tasks
+        held_devices = {session.device for session in self._sessions.values()}
+        connected = sum(bool(self._conns.get(device)) for device in self._meta)
+        claimed = sum(
+            not self._conns.get(device) and device in held_devices
+            for device in self._meta
+        )
+        total = len(self._meta)
+        counts = {
+            "total": total,
+            "connected": connected,
+            "claimed": claimed,
+            "down": total - connected - claimed,
+        }
+        degraded = []
+        if ready and not self._listener_connected:
+            degraded.append("device_inventory_listener_reconnecting")
+        if failed_tasks:
+            degraded.append("background_supervisor_failed")
+        return ready, {
+            "status": "ready" if ready else "not_ready",
+            "inventory_loaded": self._inventory_loaded,
+            "device_listener_connected": self._listener_connected,
+            "devices": counts,
+            "background_tasks_failed": failed_tasks,
+            "degraded": degraded,
+        }
 
     # ── connection lifecycle ─────────────────────────────────────────
     async def _open(self, device: str) -> _Conn | None:
@@ -733,6 +899,7 @@ class Pool:
             try:
                 conn = await asyncpg.connect(DB_DSN)
                 await conn.add_listener("keepalive_devices", self._on_device_notify)
+                self._listener_connected = True
                 print("[keepalive-mcp] device-listener active "
                       "(LISTEN keepalive_devices)", flush=True)
                 while self._running:
@@ -741,10 +908,12 @@ class Pool:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                self._listener_connected = False
                 print(f"[keepalive-mcp] device-listener down: {e}; "
                       f"retry in {RECONNECT_WAIT}s", flush=True)
                 await asyncio.sleep(RECONNECT_WAIT)
             finally:
+                self._listener_connected = False
                 if conn is not None:
                     try:
                         await conn.close()
@@ -753,7 +922,10 @@ class Pool:
 
     def _on_device_notify(self, connection, pid, channel, payload):
         # asyncpg fires this synchronously; do the async reconcile in a task.
-        asyncio.create_task(self._reconcile_from_notify(payload))
+        self._spawn_transient(
+            self._reconcile_from_notify(payload),
+            "device-reconcile",
+        )
 
     async def _reconcile_from_notify(self, payload: str):
         try:
@@ -1072,7 +1244,10 @@ class Pool:
 
         # spin a replacement connection in background (if under cap)
         if len(conns) < cap - 1:
-            asyncio.create_task(self._replace_conn(device))
+            self._spawn_transient(
+                self._replace_conn(device),
+                f"replace-connection:{device}",
+            )
 
         lock.release()  # pool is no longer shared — dedicated session has its own conn
 
@@ -1097,9 +1272,12 @@ class Pool:
     # ── status ───────────────────────────────────────────────────────
     def status_data(self) -> list[dict]:
         rows = []
+        sessions_by_device: dict[str, dict[str, _Session]] = {}
+        for sid, session in self._sessions.items():
+            sessions_by_device.setdefault(session.device, {})[sid] = session
         for device, meta in self._meta.items():
             conns  = self._conns.get(device, [])
-            held   = {sid: s for sid, s in self._sessions.items() if s.device == device}
+            held   = sessions_by_device.get(device, {})
             if conns:
                 state = "CONNECTED"
                 last_ok = max((c.last_ok for c in conns), default=0)
@@ -1126,24 +1304,46 @@ class Pool:
 pool = Pool()
 
 
+# ── non-sensitive process health ──────────────────────────────────────────────
+async def livez(request: Request):
+    """Process liveness only; never exposes device inventory."""
+    return JSONResponse(
+        {"status": "alive"},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def readyz(request: Request):
+    """Control-plane readiness; fleet connection counts are diagnostic, not a gate."""
+    ready, detail = pool.health_snapshot()
+    return JSONResponse(
+        detail,
+        status_code=200 if ready else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # ── config diff helpers ───────────────────────────────────────────────────────
 def _norm(cfg: str) -> list[str]:
-    return [l.rstrip() for l in cfg.splitlines()
-            if not any(p.search(l) for p in _VOLATILE)]
+    return [line.rstrip() for line in cfg.splitlines()
+            if not any(pattern.search(line) for pattern in _VOLATILE)]
 
 def _diff(before: str, after: str):
     b, a = _norm(before), _norm(after)
     diff = "\n".join(difflib.unified_diff(
         b, a, fromfile="running-before", tofile="running-after", lineterm=""))
-    bs = {l.strip() for l in b if l.strip()}
-    added   = [l.strip() for l in a if l.strip() and l.strip() not in bs]
-    removed = [l.strip() for l in b if l.strip() and l.strip() not in {l.strip() for l in a if l.strip()}]
+    before_set = {line.strip() for line in b if line.strip()}
+    after_set = {line.strip() for line in a if line.strip()}
+    added = [line.strip() for line in a
+             if line.strip() and line.strip() not in before_set]
+    removed = [line.strip() for line in b
+               if line.strip() and line.strip() not in after_set]
     return diff, added, removed
 
 def _verify(intended: list[str], after: str) -> dict:
-    after_set = {l.strip() for l in after.splitlines() if l.strip()}
-    present = [l for l in intended if l.strip() in after_set]
-    missing = [l for l in intended if l.strip() not in after_set]
+    after_set = {line.strip() for line in after.splitlines() if line.strip()}
+    present = [line for line in intended if line.strip() in after_set]
+    missing = [line for line in intended if line.strip() not in after_set]
     return {"expected_present": present, "expected_MISSING": missing, "match": not missing}
 
 def _cap(s: str) -> str:
@@ -1284,8 +1484,11 @@ async def find_devices(ctx: Context, query: str = "", role: str = "",
         out["note"] = f"showing {len(page)} of {len(matched)} — refine or page with cursor={nxt}"
 
     dur = int((time.monotonic() - t0) * 1000)
-    asyncio.create_task(_audit(oid, upn, sid, "(inventory)",
-                                "read", f"find q={query!r}", 0, "ok", dur, len(json.dumps(out))))
+    _spawn_background(
+        _audit(oid, upn, sid, "(inventory)",
+               "read", f"find q={query!r}", 0, "ok", dur, len(json.dumps(out))),
+        "audit-find-devices",
+    )
     return json.dumps(out, indent=2)
 
 
@@ -1321,13 +1524,9 @@ async def run(ctx: Context, device: str, command: str,
     oid, upn, mcp_sid = r
     cmd = command.strip()
 
-    blocked = _blocked_read(cmd)
-    if blocked:
-        return json.dumps({"error": blocked})
-    if not cmd.lower().startswith(READ_OK):
-        hint = ("this server is read-only — only show/ping/traceroute/dir/verify are permitted"
-                if READONLY else "use apply to push config")
-        return json.dumps({"error": f"'{cmd.split()[0]}' is not a read-only command; {hint}"})
+    command_error = _read_command_error(command)
+    if command_error:
+        return json.dumps({"error": command_error})
 
     t0 = time.monotonic()
     conn_obj: _Conn | None = None
@@ -1386,8 +1585,11 @@ async def run(ctx: Context, device: str, command: str,
             lock.release()
 
     dur = int((time.monotonic() - t0) * 1000)
-    asyncio.create_task(_audit(oid, upn, session_id or mcp_sid, device,
-                                "read", cmd, rc, status, dur, len(out)))
+    _spawn_background(
+        _audit(oid, upn, session_id or mcp_sid, device,
+               "read", cmd, rc, status, dur, len(out)),
+        "audit-run",
+    )
     # Large output: stash it and return a searchable handle instead of a lossy truncation,
     # so the LLM can grep/page the whole thing via read_output rather than lose it.
     if status == "ok" and (capture or len(out) > MAX_OUT):
@@ -1416,7 +1618,8 @@ async def read_output(ctx: Context, capture_id: str, pattern: str = "",
     if not cap or cap["oid"] != oid:
         return json.dumps({"error": f"capture '{capture_id}' not found or expired "
                            f"(they last ~{CAPTURE_TTL // 60}m and are per-user) — re-run the command"})
-    lines = cap["lines"]; total = len(lines)
+    lines = cap["lines"]
+    total = len(lines)
     limit = max(1, min(limit, 2000))
     if pattern:
         try:
@@ -1424,8 +1627,11 @@ async def read_output(ctx: Context, capture_id: str, pattern: str = "",
         except re.error as e:
             return json.dumps({"error": f"bad regex: {e}"})
         cn = max(0, min(context, 10))
-        indent = lambda s: len(s) - len(s.lstrip())
-        ranges: list[list[int]] = []; matches = 0
+        def indent(value):
+            return len(value) - len(value.lstrip())
+
+        ranges: list[list[int]] = []
+        matches = 0
         for i, ln in enumerate(lines):
             if not rx.search(ln):
                 continue
@@ -1462,8 +1668,12 @@ async def read_output(ctx: Context, capture_id: str, pattern: str = "",
         nxt    = offset + limit if offset + limit < total else None
         meta = {"capture_id": capture_id, "device": cap["device"], "command": cap["command"],
                 "total_lines": total, "returned": len(chunk), "next_offset": nxt}
-    asyncio.create_task(_audit(oid, upn, sid, cap["device"], "read",
-                                f"read_output {pattern or ('@' + str(offset))}", 0, "ok", 0, len(body)))
+    _spawn_background(
+        _audit(oid, upn, sid, cap["device"], "read",
+               f"read_output {pattern or ('@' + str(offset))}",
+               0, "ok", 0, len(body)),
+        "audit-read-output",
+    )
     return json.dumps(meta, indent=2) + "\n\n" + _cap(body)
 
 
@@ -1482,7 +1692,7 @@ async def apply(ctx: Context, device: str, config: str,
         return r
     oid, upn, mcp_sid = r
 
-    lines = [l for l in config.splitlines() if l.strip()]
+    lines = [line for line in config.splitlines() if line.strip()]
     if not lines:
         return json.dumps({"error": "no config lines provided"})
 
@@ -1538,9 +1748,12 @@ async def apply(ctx: Context, device: str, config: str,
     result = _redact_result(result)          # mask secrets in the running-config diff
     dur = int((time.monotonic() - t0) * 1000)
     diff_text = result.get("config_diff", "")
-    asyncio.create_task(_audit(oid, upn, session_id or mcp_sid, device,
-                                "write", "; ".join(lines)[:500],
-                                rc, status, dur, len(diff_text)))
+    _spawn_background(
+        _audit(oid, upn, session_id or mcp_sid, device,
+               "write", "; ".join(lines)[:500],
+               rc, status, dur, len(diff_text)),
+        "audit-apply",
+    )
     return json.dumps(result, indent=2)
 
 
@@ -1644,8 +1857,11 @@ async def claim_session(ctx: Context, device: str) -> str:
     result = await pool.claim(device, mcp_sid or "", oid)
 
     if result.get("status") in ("claimed", "existing"):
-        asyncio.create_task(_audit(oid, upn, mcp_sid, device, "claim",
-                                   result.get("session_id"), 0, "ok", 0, 0))
+        _spawn_background(
+            _audit(oid, upn, mcp_sid, device, "claim",
+                   result.get("session_id"), 0, "ok", 0, 0),
+            "audit-claim",
+        )
     return json.dumps(result, indent=2)
 
 
@@ -1716,7 +1932,8 @@ async def discover_new_device(ctx: Context, name: str, host: str,
         await asyncio.sleep(0.5)
         st = {s["name"]: s["state"] for s in pool.status_data()}.get(name)
         if st == "CONNECTED":
-            state = "CONNECTED"; break
+            state = "CONNECTED"
+            break
         if st:
             state = st                        # DOWN while still connecting / after a failure
     ok = state == "CONNECTED"
@@ -2099,15 +2316,28 @@ def _coerce_device(body: dict, *, partial: bool, name: str | None = None) -> tup
     """Validate/normalize a device payload. Returns (fields, None) or ({}, error).
     partial=True (PATCH) only touches supplied keys; partial=False (POST/PUT)
     requires the full connection set. `name` is the key and is never in `fields`."""
+    writable = {
+        "host", "port", "platform", "username", "max_connections", "enabled",
+        "role", "site", "description", "source",
+    }
+    allowed = writable | {"name"}
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        return {}, f"unknown field(s): {', '.join(unknown)}"
+    if name is not None and "name" in body and body["name"] != name:
+        return {}, "name cannot be changed; create a new device instead"
     out: dict = {}
     nm = name if name is not None else body.get("name")
     if name is None or not partial:
         if not (isinstance(nm, str) and _DEVICE_NAME_RE.match(nm or "")):
             return {}, "name is required and must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
     if "host" in body or not partial:
-        host = (body.get("host") or "").strip()
-        if not host:
-            return {}, "host is required"
+        raw_host = body.get("host")
+        if not isinstance(raw_host, str):
+            return {}, "host is required and must be a string"
+        host = raw_host.strip()
+        if not host or len(host) > 253 or any(ch.isspace() for ch in host):
+            return {}, "host must be 1..253 characters with no whitespace"
         out["host"] = host
     if "port" in body or not partial:
         try:
@@ -2118,14 +2348,20 @@ def _coerce_device(body: dict, *, partial: bool, name: str | None = None) -> tup
             return {}, "port must be 1..65535"
         out["port"] = port
     if "platform" in body or not partial:
-        plat = (body.get("platform") or "").strip()
+        raw_platform = body.get("platform")
+        if not isinstance(raw_platform, str):
+            return {}, "platform must be a string"
+        plat = raw_platform.strip()
         if plat not in _VALID_PLATFORMS:
             return {}, f"platform must be one of: {', '.join(sorted(_VALID_PLATFORMS))}"
         out["platform"] = plat
     if "username" in body or not partial:
-        user = (body.get("username") or "").strip()
-        if not user:
-            return {}, "username is required"
+        raw_username = body.get("username")
+        if not isinstance(raw_username, str):
+            return {}, "username is required and must be a string"
+        user = raw_username.strip()
+        if not user or len(user) > 128 or any(ch in user for ch in "\r\n\x00"):
+            return {}, "username must be 1..128 characters without control characters"
         out["username"] = user
     if "max_connections" in body or not partial:
         try:
@@ -2136,7 +2372,10 @@ def _coerce_device(body: dict, *, partial: bool, name: str | None = None) -> tup
             return {}, "max_connections must be 1..16"
         out["max_connections"] = mc
     if "enabled" in body or not partial:
-        out["enabled"] = bool(body.get("enabled", True))
+        enabled = body.get("enabled", True)
+        if not isinstance(enabled, bool):
+            return {}, "enabled must be a JSON boolean"
+        out["enabled"] = enabled
     for f in ("role", "site", "description", "source"):
         if f in body:
             v = body.get(f)
@@ -2252,7 +2491,8 @@ def _install_access_log_redaction():
     """Redact OAuth code/state/tokens/secrets from any uvicorn access-log line (only
     emitted when KA_ACCESS_LOG=true) so a debug session can't leak the /auth/callback
     ?code= into syslog/Ringdown."""
-    import logging, re
+    import logging
+    import re
     _pat = re.compile(r'((?:code|state|session_state|id_token|access_token|'
                       r'client_assertion|client_secret|refresh_token)=)[^&\s"\'>]+', re.I)
     _markers = ("code=", "state=", "token=", "secret=", "assertion=")
@@ -2288,6 +2528,7 @@ def _build_app():
             print(f"[keepalive-mcp] pool started · {len(pool._meta)} devices · port {PORT}", flush=True)
             yield
             await pool.stop()
+            await _drain_background_tasks()
             if _db:
                 await _db.close()
 
@@ -2296,6 +2537,8 @@ def _build_app():
     app = Starlette(
         lifespan=lifespan,
         routes=[
+            Route("/livez",             livez),
+            Route("/readyz",            readyz),
             *[Route(path, favicon_asset) for path in _FAVICON_ASSETS],
             Route("/status",          status_page),
             Route("/status.json",     status_json),
@@ -2312,4 +2555,11 @@ def _build_app():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(_build_app(), host=BIND, port=PORT, log_level="info", access_log=ACCESS_LOG)
+    uvicorn.run(
+        _build_app(),
+        host=BIND,
+        port=PORT,
+        log_level="info",
+        access_log=ACCESS_LOG,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_SECS,
+    )

@@ -7,13 +7,18 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 COPY server.py .
+COPY migrate.py .
+COPY pyproject.toml .
+COPY deploy/migrations/ ./deploy/migrations/
 COPY static/ ./static/
+RUN python -m py_compile server.py migrate.py
 RUN useradd --system --uid 10001 mcp
 USER mcp
 
 EXPOSE 8784
+STOPSIGNAL SIGTERM
 CMD ["python", "server.py"]

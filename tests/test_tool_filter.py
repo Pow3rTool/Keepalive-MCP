@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for KA_FILTER_TOOL_LIST — per-user tools/list filtering by Entra app role.
+"""Tests for KA_FILTER_TOOL_LIST: per-user tools/list filtering by Entra app role.
 
 Runnable two ways:
-  pytest test_tool_filter.py
-  python test_tool_filter.py        # prints PASS/FAIL, no pytest needed
+  pytest tests/test_tool_filter.py
+  python tests/test_tool_filter.py        # prints PASS/FAIL, no pytest needed
 
 Env is seeded BEFORE importing server so _check_config() passes without a real
 deployment (host-key policy off, dummy creds, filtering enabled). No network: the
@@ -11,9 +11,12 @@ DB pool and SSH pool are lazy and never started here.
 """
 import asyncio
 import os
+from pathlib import Path
+import sys
 import types as _types
 
 # ── seed a minimal valid config, then import the server under test ──────────────
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.update({
     "KA_DB_DSN":            "postgresql://u:p@localhost:5432/ka",
     "KA_TENANT_ID":         "00000000-0000-0000-0000-000000000000",
@@ -106,7 +109,8 @@ if __name__ == "__main__":
                 setattr(obj, name, val)
             self._undo.clear()
 
-    import inspect, traceback
+    import inspect
+    import traceback
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
     passed = failed = 0
