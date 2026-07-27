@@ -77,7 +77,10 @@ interactive Entra SSO session **and** the `KA_STATUS_ROLE` app role, because dev
 host/role/site topology is treated as sensitive internal detail, not public.
 
 Every call writes an audit row (`asyncpg` → `keepalive.audit`). Command *output* is
-never stored — only a character count.
+never stored — only a character count. Human-attributed reads, writes, sessions,
+and device changes are retained indefinitely. Machine-generated `pool-connect` and
+`pool-disconnect` telemetry is pruned after 30 days by default, in bounded batches
+backed by a partial index.
 
 ## Health and fleet convergence
 
@@ -185,6 +188,7 @@ for the authoritative, commented list. Notable knobs:
 | `KA_REQUIRED_SCOPE` / `KA_STATUS_ROLE` | delegated scope and status-page role |
 | `KA_BIND` / `KA_PORT` | listen address (default `127.0.0.1:8784`) |
 | `KA_SHUTDOWN_GRACE_SECS` / `KA_CONNECTION_CLOSE_SECS` / `KA_BACKGROUND_DRAIN_SECS` | bound HTTP drain, concurrent SSH close, and pending-audit drain during shutdown |
+| `KA_POOL_AUDIT_RETENTION_DAYS` | retention for machine-generated `pool-*` audit rows (default 30); human-attributed rows never expire |
 | `KA_KEEPALIVE_SECS` / `KA_DEDICATED_TTL_SECS` | pool tuning |
 | `KA_READONLY` | hide the `apply` config-push tool entirely + flag read-only to the LLM |
 | `KA_ALLOW_CONFIG_READ` | permit `show running-config`/`tech-support` (still redacted); off by default |

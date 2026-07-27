@@ -141,6 +141,15 @@ ACCESS_LOG        = os.environ.get("KA_ACCESS_LOG", "false").strip().lower() in 
 SHUTDOWN_GRACE_SECS = int(os.environ.get("KA_SHUTDOWN_GRACE_SECS", "3"))
 CONNECTION_CLOSE_SECS = float(os.environ.get("KA_CONNECTION_CLOSE_SECS", "2"))
 BACKGROUND_DRAIN_SECS = float(os.environ.get("KA_BACKGROUND_DRAIN_SECS", "2"))
+# Automated connection telemetry is useful for near-term troubleshooting but is not
+# part of the permanent human-attribution trail. Only `pool-*` audit verbs expire;
+# user-attributed reads, writes, sessions, and device changes are retained indefinitely.
+POOL_AUDIT_RETENTION_DAYS = int(
+    os.environ.get("KA_POOL_AUDIT_RETENTION_DAYS", "30")
+)
+_AUDIT_RETENTION_INTERVAL_SECS = 24 * 60 * 60
+_AUDIT_RETENTION_BATCH_SIZE = 10_000
+_AUDIT_RETENTION_MAX_BATCHES = 10
 
 SESSION_SECRET    = os.environ.get("KA_SESSION_SECRET", "") or secrets.token_hex(32)
 KEY_PATH          = os.environ.get("KA_CERT_KEY_PATH", "/etc/keepalive-mcp/keepalive-mcp.key")
@@ -336,6 +345,8 @@ def _check_config():
         raise SystemExit(
             "KA_SHUTDOWN_GRACE_SECS must be >= 1 and "
             "KA_CONNECTION_CLOSE_SECS/KA_BACKGROUND_DRAIN_SECS must be > 0.")
+    if POOL_AUDIT_RETENTION_DAYS < 1:
+        raise SystemExit("KA_POOL_AUDIT_RETENTION_DAYS must be >= 1.")
     if SSH_HOSTKEY_POLICY == "strict":
         try:
             seeded = os.path.getsize(SSH_KNOWN_HOSTS) > 0
@@ -439,6 +450,60 @@ async def _audit_intent(who: str, who_upn: str, session_id: str | None,
     except Exception as e:
         print(f"[audit] INTENT write failed, refusing mutation: {e}", flush=True)
         return False
+
+
+async def _prune_pool_audit() -> int:
+    """Delete bounded batches of expired machine-generated connection telemetry.
+
+    The predicate is intentionally exact and narrow: human-attributed audit verbs
+    have no expiry. Batching keeps each DELETE transaction short, and the matching
+    partial index added by migration 002 avoids scanning permanent history.
+    """
+    pool = await _db_pool()
+    deleted_total = 0
+    for _ in range(_AUDIT_RETENTION_MAX_BATCHES):
+        result = await pool.execute(
+            """
+            WITH doomed AS (
+                SELECT id
+                FROM audit
+                WHERE verb LIKE 'pool-%'
+                  AND ts < now() - make_interval(days => $1::int)
+                ORDER BY ts
+                LIMIT $2
+            )
+            DELETE FROM audit AS target
+            USING doomed
+            WHERE target.id = doomed.id
+            """,
+            POOL_AUDIT_RETENTION_DAYS,
+            _AUDIT_RETENTION_BATCH_SIZE,
+        )
+        deleted = int(result.rsplit(" ", 1)[-1])
+        deleted_total += deleted
+        if deleted < _AUDIT_RETENTION_BATCH_SIZE:
+            break
+        await asyncio.sleep(0)
+    return deleted_total
+
+
+async def _audit_retention_loop() -> None:
+    """Run pool-telemetry retention without delaying startup or fleet readiness."""
+    while True:
+        try:
+            deleted = await _prune_pool_audit()
+            if deleted:
+                print(
+                    f"[keepalive-mcp] pruned {deleted} pool audit rows older than "
+                    f"{POOL_AUDIT_RETENTION_DAYS} days",
+                    flush=True,
+                )
+        except Exception as e:
+            # Retention maintenance is not a serving-path dependency. Keep retrying
+            # daily and leave an operational breadcrumb without taking readiness down.
+            print(f"[keepalive-mcp] audit retention failed: {e}", flush=True)
+        await asyncio.sleep(_AUDIT_RETENTION_INTERVAL_SECS)
+
 
 async def _load_devices() -> list[dict]:
     pool = await _db_pool()
@@ -721,6 +786,8 @@ class Pool:
                 self._session_reaper(), name="session-reaper"),
             "device_listener": asyncio.create_task(
                 self._listen_devices(), name="device-listener"),
+            "audit_retention": asyncio.create_task(
+                _audit_retention_loop(), name="audit-retention"),
         }
 
     async def stop(self):

@@ -54,6 +54,18 @@ migration_count="$("$PODMAN" exec -e PGPASSWORD=keepalive-test "$database_name" 
   -c "SELECT count(*) FROM keepalive_schema_migrations")"
 test "$migration_count" = "$expected_migrations"
 
+# Seed both sides of the retention boundary before runtime starts. Startup maintenance
+# must delete only expired pool telemetry and preserve permanent human attribution.
+"$PODMAN" exec -e PGPASSWORD=keepalive-test "$database_name" \
+  psql -v ON_ERROR_STOP=1 -U keepalive -d keepalive \
+  -c "
+    INSERT INTO audit (ts, who, device, verb, command, rc, status, dur_ms, out_chars)
+    VALUES
+      (now() - interval '31 days', 'pool', 'old-pool', 'pool-connect', NULL, 1, 'old', 0, 0),
+      (now() - interval '10 years', 'operator', 'old-human', 'read', 'show clock', 0, 'ok', 1, 10),
+      (now(), 'pool', 'recent-pool', 'pool-connect', NULL, 0, 'connected', 0, 0);
+  " >/dev/null
+
 # Runtime comes ready with an empty fleet; it must not wait for SSH convergence.
 "$PODMAN" run -d --name "$runtime_name" --network "$network_name" \
   -e KA_DB_DSN="$dsn" \
@@ -77,6 +89,25 @@ for _attempt in $(seq 1 20); do
   sleep 1
 done
 "$PODMAN" exec "$runtime_name" python /tmp/check-runtime.py
+
+for _attempt in $(seq 1 20); do
+  expired_pool="$("$PODMAN" exec -e PGPASSWORD=keepalive-test "$database_name" \
+    psql -At -U keepalive -d keepalive \
+    -c "SELECT count(*) FROM audit WHERE device = 'old-pool'")"
+  if [ "$expired_pool" = 0 ]; then
+    break
+  fi
+  sleep 1
+done
+test "$expired_pool" = 0
+permanent_human="$("$PODMAN" exec -e PGPASSWORD=keepalive-test "$database_name" \
+  psql -At -U keepalive -d keepalive \
+  -c "SELECT count(*) FROM audit WHERE device = 'old-human'")"
+recent_pool="$("$PODMAN" exec -e PGPASSWORD=keepalive-test "$database_name" \
+  psql -At -U keepalive -d keepalive \
+  -c "SELECT count(*) FROM audit WHERE device = 'recent-pool'")"
+test "$permanent_human" = 1
+test "$recent_pool" = 1
 
 # Keep an HTTP request deliberately incomplete while stopping. Uvicorn must bound
 # its drain and still let PID 1 exit cleanly inside the container stop window.

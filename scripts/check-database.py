@@ -42,7 +42,9 @@ async def main() -> None:
                 ('test', 'migration-check', 'read', 'show clock', 0, 'ok', 1, 10)
             """
         )
-        assert await writer.fetchval("SELECT count(*) FROM audit") == 1
+        assert await writer.fetchval(
+            "SELECT count(*) FROM audit WHERE who = 'test'"
+        ) == 1
     finally:
         await listener.close()
         await writer.close()
