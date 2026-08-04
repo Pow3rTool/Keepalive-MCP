@@ -61,6 +61,8 @@ def test_read_command_validator_refuses_injection_and_non_read_verbs(command):
     [
         "show clock",
         "show interfaces | include up",
+        "show version | no-more",
+        "show chassis cluster status | no-more",
         "ping 192.0.2.1",
         "traceroute 192.0.2.1",
         "changeto context customer-a",

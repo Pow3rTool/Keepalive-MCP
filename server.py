@@ -205,9 +205,12 @@ LIVE_APPLY = {"cisco_iosxe", "cisco_ios", "cisco_asa", "cisco_nxos"}
 # Platforms with native commit/abort
 COMMIT_CAP = {"cisco_iosxr", "arista_eos", "juniper_junos"}
 
-# Platforms an admin may onboard via discover_new_device (the live Cisco fleet).
-# Widen (e.g. cisco_ios, cisco_nxos) if a device outside this set needs tool onboarding.
-_ONBOARD_PLATFORMS = {"cisco_iosxe", "cisco_iosxr", "cisco_asa"}
+# Platforms an admin may onboard via discover_new_device. Keep this narrower than
+# the REST API allowlist until a platform has been exercised against the shared
+# fleet credential and its Scrapli core driver is part of the supported pool.
+_ONBOARD_PLATFORMS = {
+    "cisco_iosxe", "cisco_iosxr", "cisco_asa", "juniper_junos",
+}
 
 READ_OK = frozenset({
     "show", "ping", "traceroute", "dir", "display", "get", "verify",
@@ -232,7 +235,7 @@ _BLOCKED_CONFIG = [re.compile(p, re.I) for p in (
 _BLOCKED_ALWAYS = [re.compile(p, re.I) for p in (
     r"\bcrypto\s+key\b",                         # show crypto key ... (private keys)
     r"\bkey\s+(chain|zeroize|mypubkey)\b",
-    r"\bmore\b",                                 # file pager; arbitrary file read
+    r"^\s*more(?:\s|$)",                          # file pager; allow Junos `| no-more`
     r"\btype\b\s+\S",                            # type <file>
     r"\b(dir|fsck|show\s+file)\b.*(nvram|flash|bootflash|disk\d|usb)",
     r"\bshow\b.*\bkey(s)?\b",                    # show ... keys (SNMPv3, EIGRP auth, etc.)
@@ -1956,9 +1959,10 @@ async def discover_new_device(ctx: Context, name: str, host: str,
                               site: str = "", role: str = "") -> str:
     """ADMIN-ONLY: onboard a device to the pool by name + host, then verify it.
     Fleet SSH creds are shared, so you only supply name, host (IP preferred over DNS),
-    and platform — cisco_iosxe (default), cisco_iosxr, or cisco_asa. Optional site/role
-    tags. Inserts the device (the pool connects it immediately) and waits briefly to
-    report whether it came up CONNECTED or is still DOWN (bad host/reachability/creds).
+    and platform — cisco_iosxe (default), cisco_iosxr, cisco_asa, or juniper_junos.
+    Optional site/role tags. Inserts the device (the pool connects it immediately) and
+    waits briefly to report whether it came up CONNECTED or is still DOWN (bad
+    host/reachability/creds).
     Requires the Keepalive.Admin role."""
     r = _require_admin(ctx)
     if isinstance(r, str):
