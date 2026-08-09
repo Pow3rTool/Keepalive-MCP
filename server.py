@@ -1481,22 +1481,35 @@ _SESSION_ROLE_NOTE = (
     "Keepalive.Read for connection affinity (e.g. ASA `changeto` context navigation). "
     if READONLY else
     "A Keepalive.Config role additionally allows apply and session management. ")
+_SESSION_USAGE_GUIDANCE = (
+    "Do not claim a session for one command or for multiple independent commands: "
+    "run/apply already serialize each call on the shared pool. Use claim_session only when "
+    "a multi-call workflow must stay exclusive on one SSH connection because later calls "
+    "depend on connection-local state (for example, ASA `changeto context v123-v234` followed "
+    "by context-specific show or configuration commands). Pass its session_id to every "
+    "dependent run/apply call, then release_session immediately when the workflow ends. ")
 
 mcp = FastMCP(
     "keepalive-mcp",
     instructions=(
-        _RO_BANNER +
-        "Reach into Cisco (and multi-vendor) network gear over SSH. "
-        "find_devices searches the inventory; run executes read-only commands "
-        "(show, ping, traceroute) and returns structured JSON when parsed=true; "
-        "apply pushes config — confirm=false is a dry-run, confirm=true applies. "
-        "claim_session reserves an exclusive connection for multi-command work; "
-        "release_session returns it. A Keepalive.Read role allows find_devices and run. " +
-        _SESSION_ROLE_NOTE +
-        "discover_new_device (Keepalive.Admin only) onboards a device by name + host. "
-        "Large command output is auto-captured; read_output greps (pattern=) or pages "
-        "(offset=/limit=) it by capture_id. For a known target, filter on the device first "
-        "(e.g. `show access-list | include <x>`) — far cheaper than pulling the whole dump."),
+        _RO_BANNER
+        + (
+            "Reach into Cisco (and multi-vendor) network gear over SSH. "
+            "find_devices searches the inventory; run executes read-only commands "
+            "(show, ping, traceroute) and returns structured JSON when parsed=true; "
+            "apply pushes config — confirm=false is a dry-run, confirm=true applies. "
+        )
+        + _SESSION_USAGE_GUIDANCE
+        + "A Keepalive.Read role allows find_devices and run. "
+        + _SESSION_ROLE_NOTE
+        + (
+            "discover_new_device (Keepalive.Admin only) onboards a device by name + host. "
+            "Large command output is auto-captured; read_output greps (pattern=) or pages "
+            "(offset=/limit=) it by capture_id. For a known target, filter on the device "
+            "first (e.g. `show access-list | include <x>`) — far cheaper than pulling the "
+            "whole dump."
+        )
+    ),
     host=BIND, port=PORT, stateless_http=False, json_response=False,
     streamable_http_path="/",
     transport_security=TransportSecuritySettings(
@@ -1581,8 +1594,9 @@ async def run(ctx: Context, device: str, command: str,
     """Run a READ-ONLY command on a device (show, ping, traceroute, dir, verify;
     `changeto` for ASA multi-context navigation).
     parsed=true returns structured JSON via TextFSM where supported.
-    Pass session_id if you have a dedicated session from claim_session — recommended for
-    ASA context work so `changeto` stays scoped to your own connection.
+    Default: omit session_id; each standalone call is safely serialized on the shared pool.
+    Pass session_id only when continuing a claimed, stateful multi-call workflow, such as
+    ASA `changeto context <name>` followed by commands that must stay in that context.
     LARGE OUTPUT: anything over the char cap is auto-captured server-side and returned as a
     capture_id + preview (not truncated) — use read_output to grep/page it. capture=true
     forces that even for smaller output. Cheaper for a known target: filter on the device,
@@ -1756,7 +1770,8 @@ async def apply(ctx: Context, device: str, config: str,
     SAFETY: halts at the first rejected line, never saves a failed change.
     On live-apply platforms (IOS/XE/ASA) partial state is left live — use the returned
     diff to assess and fix. On commit-capable platforms (XR/Junos/EOS) nothing lands on failure.
-    Pass session_id to use a dedicated connection from claim_session."""
+    Default: omit session_id; apply is already serialized. Pass session_id only when this
+    call continues a claimed workflow that depends on connection-local state."""
     r = _require_config(ctx)
     if isinstance(r, str):
         return r
@@ -1914,9 +1929,14 @@ async def _apply_commit(conn: _Conn, device: str, lines: list[str], save: bool,
 
 @mcp.tool()
 async def claim_session(ctx: Context, device: str) -> str:
-    """Reserve an exclusive SSH connection to a device for multi-command or config work.
+    """Reserve an exclusive SSH connection ONLY for a stateful multi-call workflow.
+    Do NOT claim for one command or for independent show/config commands: run/apply already
+    serialize each call on the shared pool. Claim only when later calls depend on state held
+    by the same connection and must not interleave with another caller — for example, ASA
+    `changeto context v123-v234` followed by context-specific show or configuration commands.
     Returns a session_id to pass to run/apply. The session auto-releases after
-    DEDICATED_TTL seconds of inactivity. Use release_session when done.
+    DEDICATED_TTL seconds of inactivity. Pass it to every dependent call and use
+    release_session immediately when done, including after an error.
     If the device is already claimed, returns how long the holder has been idle
     and when it auto-expires so you can decide whether to retry."""
     r = _require_session(ctx)
@@ -1937,7 +1957,8 @@ async def claim_session(ctx: Context, device: str) -> str:
 
 @mcp.tool()
 async def release_session(ctx: Context, session_id: str) -> str:
-    """Release a dedicated session early (before the inactivity TTL). Good hygiene."""
+    """Release a dedicated session as soon as its stateful workflow ends or fails.
+    Do not leave exclusivity held until the inactivity TTL."""
     r = _require_session(ctx)
     if isinstance(r, str):
         return r

@@ -33,10 +33,10 @@ opens each connection once and keeps it alive:
 | Tool | Role required | What it does |
 |------|---------------|--------------|
 | `find_devices` | `Keepalive.Read` | Search the inventory by name glob, role, platform, or site. Paginated — never dumps the whole fleet. |
-| `run` | `Keepalive.Read` | Run a **read-only** command (`show`, `ping`, `traceroute`, `dir`, `verify`). Write verbs (`configure`/`reload`/`copy`/`write`/`clear`) are refused. `parsed=true` returns structured JSON via TextFSM where supported. |
-| `apply` | `Keepalive.Config` | Push config lines. **`confirm=false` (default) is a dry-run preview**; call again with `confirm=true` to apply. `save=true` writes memory only on full success. |
-| `claim_session` | `Keepalive.Config` | Reserve an **exclusive** connection to a device for multi-step work; returns a `session_id` to pass to `run`/`apply`. Auto-releases after `KA_DEDICATED_TTL_SECS` of inactivity. |
-| `release_session` | `Keepalive.Config` | Release a dedicated session early. |
+| `run` | `Keepalive.Read` | Run a **read-only** command (`show`, `ping`, `traceroute`, `dir`, `verify`). Standalone calls use the shared pool and are serialized safely; no claim is needed. Write verbs (`configure`/`reload`/`copy`/`write`/`clear`) are refused. `parsed=true` returns structured JSON via TextFSM where supported. |
+| `apply` | `Keepalive.Config` | Push config lines. **`confirm=false` (default) is a dry-run preview**; call again with `confirm=true` to apply. Standalone calls are serialized; no claim is needed. `save=true` writes memory only on full success. |
+| `claim_session` | `Keepalive.Config` | Reserve an **exclusive** connection only when a stateful multi-call workflow must retain connection-local state, such as ASA `changeto context …` followed by context-specific commands. Do not claim for one command or independent commands. Returns a `session_id` to pass to every dependent `run`/`apply` call. |
+| `release_session` | `Keepalive.Config` | Release a dedicated session immediately when its stateful workflow ends or fails. |
 | `discover_new_device` | `Keepalive.Admin` | Onboard a device by **name + host** (IP preferred), platform `cisco_iosxe`/`cisco_iosxr`/`cisco_asa`/`juniper_junos`. Uses the shared `KA_DEFAULT_USERNAME`/creds, inserts the row (pool connects it live via `NOTIFY`), and reports `CONNECTED` vs `DOWN`. Fleet management also available via the `/devices` REST API + `kadev`. |
 | `read_output` | `Keepalive.Read` | Grep (`pattern=`, with `context` lines) or page (`offset`/`limit`) a large output captured by a prior `run` — output over `KA_MAX_OUTPUT_CHARS` is stashed server-side (RAM, per-user, TTL'd) as a `capture_id` instead of being truncated, so the LLM can examine multi-MB dumps (big ACLs, tech-support) in slices. |
 
@@ -57,7 +57,18 @@ opens each connection once and keeps it alive:
 
 ### Dedicated sessions
 
-A `claim_session` binds an exclusive connection to **both** the MCP session id and the
+Ordinary `run` and `apply` calls acquire the per-device lock for their duration and then
+release it. **Do not claim a session for a single command or merely because you have several
+independent commands to run.** Those calls should use the shared pool directly.
+
+Use `claim_session` only when a multi-call workflow must remain on one exclusive SSH
+connection because a later call depends on connection-local state established by an earlier
+call. The canonical example is an ASA workflow that runs `changeto context v123-v234` and
+then issues context-specific show or configuration commands. Pass the returned `session_id`
+to every dependent `run`/`apply` call, and call `release_session` immediately when the
+workflow finishes or errors rather than waiting for the inactivity TTL.
+
+A claim binds its exclusive connection to **both** the MCP session id and the
 authenticated principal (`oid`) — one caller cannot reuse another's claimed
 connection. The pool immediately spins a replacement so the shared slot stays warm.
 Per-device connection cap is `max_connections` (from the DB, default 2); at cap, a

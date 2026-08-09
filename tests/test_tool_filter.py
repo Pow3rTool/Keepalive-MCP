@@ -45,6 +45,19 @@ def _full_tools():
     return asyncio.run(server.mcp.list_tools())
 
 
+def test_session_tool_guidance_reserves_claims_for_stateful_workflows():
+    tools = {tool.name: tool for tool in _full_tools()}
+    claim_description = " ".join(tools["claim_session"].description.split())
+    run_description = " ".join(tools["run"].description.split())
+
+    assert "Do NOT claim for one command or for independent" in claim_description
+    assert "later calls depend on state held by the same connection" in claim_description
+    assert "changeto context v123-v234" in claim_description
+    assert "release_session immediately" in claim_description
+    assert "Default: omit session_id" in run_description
+    assert "stateful multi-call workflow" in run_description
+
+
 def _names(tools):
     return {t.name for t in tools}
 
